@@ -1,0 +1,8 @@
+{
+  "name": "igortimer",
+  "description": "Desktop billable time tracker with floating transparent window, idle detection, and SQLite persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
