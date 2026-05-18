@@ -6,13 +6,16 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, QPoint, Signal, QStringListModel
 from PySide6.QtGui import QAction, QColor, QPalette
 
+from assets import app_icon
+
 class FloatingTimer(QWidget):
     """
     A small, semi-transparent window that stays on top of all other windows.
     """
-    def __init__(self, db):
+    def __init__(self, db, on_open_settings=None):
         super().__init__()
         self.db = db
+        self.on_open_settings = on_open_settings
         self.current_segment_id = None
         self.current_client_id = None
         self.seconds_elapsed = 0
@@ -29,6 +32,8 @@ class FloatingTimer(QWidget):
         self.drag_pos = None
 
     def init_ui(self):
+        self.setWindowIcon(app_icon())
+
         # Window properties
         self.setWindowFlags(
             Qt.WindowStaysOnTopHint | 
@@ -273,6 +278,16 @@ class FloatingTimer(QWidget):
             self.status_label.setText("В процессе")
             self.display_timer.start(1000)
 
+    def toggle_start_stop(self):
+        if self.current_segment_id:
+            self.stop_work()
+        else:
+            self.toggle_work()
+
+    def toggle_pause_resume(self):
+        if self.current_segment_id:
+            self.toggle_work()
+
     def stop_work(self):
         if self.current_segment_id:
             self.db.end_segment(self.current_segment_id)
@@ -356,6 +371,9 @@ class FloatingTimer(QWidget):
 
         journal_act = QAction("Открыть журнал", self)
         journal_act.triggered.connect(self.show_journal)
+
+        settings_act = QAction("Настройки", self)
+        settings_act.triggered.connect(self.open_settings)
         
         exit_act = QAction("Выйти из приложения", self)
         exit_act.triggered.connect(self.quit_app)
@@ -363,6 +381,7 @@ class FloatingTimer(QWidget):
         menu.addAction(change_client_act)
         menu.addAction(add_reminder_act)
         menu.addAction(journal_act)
+        menu.addAction(settings_act)
         menu.addSeparator()
         menu.addAction(exit_act)
         
@@ -377,6 +396,10 @@ class FloatingTimer(QWidget):
                 widget.raise_()
                 widget.activateWindow()
                 return
+
+    def open_settings(self):
+        if self.on_open_settings:
+            self.on_open_settings()
 
     def quit_app(self):
         from PySide6.QtWidgets import QApplication
@@ -395,4 +418,3 @@ class FloatingTimer(QWidget):
 
     def mouseReleaseEvent(self, event):
         self.drag_pos = None
-

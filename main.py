@@ -3,16 +3,19 @@ import os
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtCore import Qt
 
+from assets import app_icon
 from db import Database
 from floating_timer import FloatingTimer
 from idle_detector import IdleDetector
 from hotkeys import GlobalHotkeyManager
 from journal_window import JournalWindow
+from settings_window import SettingsWindow
 
 def main():
     # 1. Initialize App
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(app_icon())
 
     # 2. Database Setup
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +32,15 @@ def main():
         db.add_client("Разработка ПО", "Внутренний проект", 0)
 
     # 3. Main Windows
-    timer_window = FloatingTimer(db)
+    hotkey_manager = None
+    settings_window = SettingsWindow(db)
+
+    def show_settings():
+        settings_window.show()
+        settings_window.raise_()
+        settings_window.activateWindow()
+
+    timer_window = FloatingTimer(db, on_open_settings=show_settings)
     journal_window = JournalWindow(db)
 
     # 4. Crash Recovery Check
@@ -65,13 +76,11 @@ def main():
     idle_thread.start()
 
     # 5. Hotkeys Integration
-    hotkey_manager = GlobalHotkeyManager()
-    
     def handle_hotkey(action):
         if action == 'toggle_timer':
-            timer_window.toggle_work()
+            timer_window.toggle_start_stop()
         elif action == 'pause_timer':
-            timer_window.toggle_work() 
+            timer_window.toggle_pause_resume()
         elif action == 'add_note':
             timer_window.add_note()
         elif action == 'add_reminder':
@@ -95,14 +104,29 @@ def main():
                     timer_window.stop_work()
                     timer_window.toggle_work()
 
-    hotkey_manager.hotkey_triggered.connect(handle_hotkey)
-    hotkey_manager.start()
+    def start_hotkey_manager():
+        nonlocal hotkey_manager
+
+        if hotkey_manager:
+            hotkey_manager.stop()
+            hotkey_manager.wait(1000)
+
+        hotkey_manager = GlobalHotkeyManager(db.get_hotkeys())
+        hotkey_manager.hotkey_triggered.connect(handle_hotkey)
+        hotkey_manager.start()
+
+    def restart_hotkey_manager():
+        start_hotkey_manager()
+
+    settings_window.hotkeys_changed.connect(restart_hotkey_manager)
+    start_hotkey_manager()
 
     # 6. Final cleanup on exit
     def cleanup():
         print("Stopping threads and saving data...")
         idle_thread.stop()
-        hotkey_manager.stop()
+        if hotkey_manager:
+            hotkey_manager.stop()
         timer_window.stop_work()
 
     app.aboutToQuit.connect(cleanup)

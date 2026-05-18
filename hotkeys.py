@@ -1,6 +1,8 @@
 from pynput import keyboard
 from PySide6.QtCore import QThread, Signal
 
+from hotkey_definitions import DEFAULT_HOTKEYS
+
 class GlobalHotkeyManager(QThread):
     """
     Listens for global system-wide hotkeys using pynput.
@@ -8,25 +10,17 @@ class GlobalHotkeyManager(QThread):
     """
     hotkey_triggered = Signal(str) # Key code like 'toggle_timer', 'stop_timer', etc.
 
-    def __init__(self):
+    def __init__(self, hotkeys=None):
         super().__init__()
         self._running = True
         self.listener = None
+        self.hotkeys = hotkeys or DEFAULT_HOTKEYS.copy()
 
     def run(self):
-        # Define hotkey mappings
         hotkeys = {
-            '<ctrl>+<alt>+s': lambda: self.hotkey_triggered.emit('toggle_timer'),
-            '<ctrl>+<alt>+<space>': lambda: self.hotkey_triggered.emit('pause_timer'),
-            '<ctrl>+<alt>+n': lambda: self.hotkey_triggered.emit('add_note'),
-            '<ctrl>+<alt>+r': lambda: self.hotkey_triggered.emit('add_reminder'),
-            '<ctrl>+<alt>+c': lambda: self.hotkey_triggered.emit('change_client'),
-            '<ctrl>+<alt>+j': lambda: self.hotkey_triggered.emit('open_journal')
+            hotkey: lambda current_action=action: self.hotkey_triggered.emit(current_action)
+            for action, hotkey in self.hotkeys.items()
         }
-        
-        # Add quick client switches 1-9
-        for i in range(1, 10):
-            hotkeys[f'<ctrl>+<alt>+{i}'] = lambda x=i: self.hotkey_triggered.emit(f'switch_client_{x}')
 
         with keyboard.GlobalHotKeys(hotkeys) as self.listener:
             self.listener.join()

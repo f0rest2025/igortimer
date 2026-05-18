@@ -2,6 +2,8 @@ import sqlite3
 import os
 from datetime import datetime
 
+from hotkey_definitions import DEFAULT_HOTKEYS, setting_key_for_action
+
 class Database:
     def __init__(self, db_path="data/tracker.db"):
         self.db_path = db_path
@@ -57,6 +59,10 @@ class Database:
             ('rounding_mode', 'none'),
             ('theme', 'dark')
         ]
+        default_settings.extend(
+            (setting_key_for_action(action), hotkey)
+            for action, hotkey in DEFAULT_HOTKEYS.items()
+        )
         cursor.executemany("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", default_settings)
         
         self.conn.commit()
@@ -133,6 +139,26 @@ class Database:
     def set_setting(self, key, value):
         self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
         self.conn.commit()
+
+    # --- Hotkeys ---
+    def get_hotkeys(self):
+        return {
+            action: self.get_setting(setting_key_for_action(action), default)
+            for action, default in DEFAULT_HOTKEYS.items()
+        }
+
+    def set_hotkey(self, action, hotkey):
+        self.set_setting(setting_key_for_action(action), hotkey)
+
+    def find_hotkey_conflict(self, hotkey, exclude_action=None):
+        for action, assigned_hotkey in self.get_hotkeys().items():
+            if action != exclude_action and assigned_hotkey == hotkey:
+                return action
+        return None
+
+    def reset_hotkeys_to_default(self):
+        for action, hotkey in DEFAULT_HOTKEYS.items():
+            self.set_hotkey(action, hotkey)
 
     def get_open_segment(self):
         """Finds any segment that was started but not finished (e.g. after a crash)."""

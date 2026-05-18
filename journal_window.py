@@ -8,6 +8,8 @@ from export_excel import export_to_excel
 import os
 from datetime import datetime
 
+from assets import app_icon
+
 class JournalWindow(QMainWindow):
     """
     Main data exploration window. Shows all time segments grouped by client.
@@ -16,6 +18,7 @@ class JournalWindow(QMainWindow):
         super().__init__()
         self.db = db
         self.setWindowTitle("Журнал времени (Сгруппированный)")
+        self.setWindowIcon(app_icon())
         self.resize(1000, 700)
         
         self.init_ui()

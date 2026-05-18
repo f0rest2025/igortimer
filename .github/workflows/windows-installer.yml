@@ -32,7 +32,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pillow
+
+      - name: Build Windows icon
+        shell: pwsh
+        run: |
+          python -c "from PIL import Image; Image.open('logo.png').save('logo.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
 
       - name: Validate Python sources
         shell: pwsh
@@ -47,6 +52,8 @@ jobs:
             --windowed `
             --name igortimer `
             --collect-all pynput `
+            --add-data "logo.png;." `
+            --icon logo.ico `
             main.py
 
       - name: Install Inno Setup
