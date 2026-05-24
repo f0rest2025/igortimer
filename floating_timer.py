@@ -196,8 +196,14 @@ class FloatingTimer(QWidget):
         self.reminder_check_timer.start(5000)
 
     def load_settings(self):
-        opacity = float(self.db.get_setting('opacity', '0.8'))
-        self.setWindowOpacity(opacity)
+        try:
+            opacity = float(self.db.get_setting('opacity', '0.8'))
+        except (TypeError, ValueError):
+            opacity = 0.8
+        self.apply_opacity(opacity)
+
+    def apply_opacity(self, opacity):
+        self.setWindowOpacity(max(0.3, min(1.0, float(opacity))))
 
     def update_client_list(self):
         clients = self.db.get_clients()

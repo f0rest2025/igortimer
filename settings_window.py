@@ -8,6 +8,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSlider,
     QVBoxLayout,
 )
 
@@ -47,6 +49,7 @@ SPECIAL_KEYS = {
 
 class SettingsWindow(QDialog):
     hotkeys_changed = Signal()
+    opacity_changed = Signal(float)
 
     def __init__(self, db):
         super().__init__()
@@ -54,17 +57,45 @@ class SettingsWindow(QDialog):
         self.recording_action = None
         self.hotkey_value_labels = {}
         self.record_buttons = {}
+        self.opacity_value_label = None
+        self.opacity_slider = None
 
         self.setWindowTitle("Настройки")
         self.setWindowIcon(app_icon())
-        self.resize(560, 520)
+        self.resize(640, 620)
         self.setModal(False)
 
         self.init_ui()
+        self.refresh_opacity()
         self.refresh_hotkey_labels()
 
     def init_ui(self):
         root_layout = QVBoxLayout(self)
+
+        window_title = QLabel("Окно")
+        window_title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        root_layout.addWidget(window_title)
+
+        window_frame = QFrame()
+        window_frame.setFrameShape(QFrame.StyledPanel)
+        window_layout = QGridLayout(window_frame)
+        window_layout.setColumnStretch(1, 1)
+
+        window_layout.addWidget(QLabel("Прозрачность окна"), 0, 0)
+
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(30, 100)
+        self.opacity_slider.setSingleStep(5)
+        self.opacity_slider.setPageStep(10)
+        self.opacity_slider.valueChanged.connect(self.handle_opacity_changed)
+        window_layout.addWidget(self.opacity_slider, 0, 1)
+
+        self.opacity_value_label = QLabel()
+        self.opacity_value_label.setMinimumWidth(48)
+        self.opacity_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        window_layout.addWidget(self.opacity_value_label, 0, 2)
+
+        root_layout.addWidget(window_frame)
 
         title = QLabel("Горячие клавиши")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -101,7 +132,11 @@ class SettingsWindow(QDialog):
             grid.addWidget(hotkey_label, row, 1)
             grid.addWidget(record_button, row, 2)
 
-        root_layout.addWidget(frame)
+        hotkeys_scroll = QScrollArea()
+        hotkeys_scroll.setWidgetResizable(True)
+        hotkeys_scroll.setFrameShape(QFrame.NoFrame)
+        hotkeys_scroll.setWidget(frame)
+        root_layout.addWidget(hotkeys_scroll, 1)
 
         buttons_layout = QHBoxLayout()
         buttons_layout.addStretch()
@@ -115,6 +150,27 @@ class SettingsWindow(QDialog):
         buttons_layout.addWidget(close_button)
 
         root_layout.addLayout(buttons_layout)
+
+    def refresh_opacity(self):
+        opacity = self.current_opacity()
+        value = int(round(opacity * 100))
+        self.opacity_slider.blockSignals(True)
+        self.opacity_slider.setValue(value)
+        self.opacity_slider.blockSignals(False)
+        self.opacity_value_label.setText(f"{value}%")
+
+    def current_opacity(self):
+        try:
+            opacity = float(self.db.get_setting("opacity", "0.8"))
+        except (TypeError, ValueError):
+            opacity = 0.8
+        return max(0.3, min(1.0, opacity))
+
+    def handle_opacity_changed(self, value):
+        opacity = value / 100
+        self.opacity_value_label.setText(f"{value}%")
+        self.db.set_setting("opacity", f"{opacity:.2f}")
+        self.opacity_changed.emit(opacity)
 
     def refresh_hotkey_labels(self):
         hotkeys = self.db.get_hotkeys()

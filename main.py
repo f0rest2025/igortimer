@@ -119,6 +119,7 @@ def main():
         start_hotkey_manager()
 
     settings_window.hotkeys_changed.connect(restart_hotkey_manager)
+    settings_window.opacity_changed.connect(timer_window.apply_opacity)
     start_hotkey_manager()
 
     # 6. Final cleanup on exit
