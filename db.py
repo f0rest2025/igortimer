@@ -54,6 +54,7 @@ class Database:
         # Initialize default settings
         default_settings = [
             ('opacity', '0.8'),
+            ('app_color', '#4ade80'),
             ('idle_threshold', '300'), # 5 minutes
             ('always_on_top', '1'),
             ('rounding_mode', 'none'),

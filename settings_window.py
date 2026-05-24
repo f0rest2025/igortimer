@@ -1,6 +1,7 @@
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QColor, QKeyEvent
 from PySide6.QtWidgets import (
+    QColorDialog,
     QDialog,
     QFrame,
     QGridLayout,
@@ -50,6 +51,7 @@ SPECIAL_KEYS = {
 class SettingsWindow(QDialog):
     hotkeys_changed = Signal()
     opacity_changed = Signal(float)
+    color_changed = Signal(str)
 
     def __init__(self, db):
         super().__init__()
@@ -59,6 +61,8 @@ class SettingsWindow(QDialog):
         self.record_buttons = {}
         self.opacity_value_label = None
         self.opacity_slider = None
+        self.color_preview = None
+        self.color_button = None
 
         self.setWindowTitle("Настройки")
         self.setWindowIcon(app_icon())
@@ -67,6 +71,7 @@ class SettingsWindow(QDialog):
 
         self.init_ui()
         self.refresh_opacity()
+        self.refresh_app_color()
         self.refresh_hotkey_labels()
 
     def init_ui(self):
@@ -94,6 +99,17 @@ class SettingsWindow(QDialog):
         self.opacity_value_label.setMinimumWidth(48)
         self.opacity_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         window_layout.addWidget(self.opacity_value_label, 0, 2)
+
+        window_layout.addWidget(QLabel("Цвет приложения"), 1, 0)
+
+        self.color_preview = QLabel()
+        self.color_preview.setMinimumHeight(28)
+        self.color_preview.setAlignment(Qt.AlignCenter)
+        window_layout.addWidget(self.color_preview, 1, 1)
+
+        self.color_button = QPushButton("Выбрать из палитры")
+        self.color_button.clicked.connect(self.choose_app_color)
+        window_layout.addWidget(self.color_button, 1, 2)
 
         root_layout.addWidget(window_frame)
 
@@ -171,6 +187,51 @@ class SettingsWindow(QDialog):
         self.opacity_value_label.setText(f"{value}%")
         self.db.set_setting("opacity", f"{opacity:.2f}")
         self.opacity_changed.emit(opacity)
+
+    def refresh_app_color(self):
+        color = self.current_app_color()
+        self.color_preview.setText(color.upper())
+        self.color_preview.setStyleSheet(
+            f"""
+            QLabel {{
+                background-color: {color};
+                color: {self.text_color_for_background(color)};
+                border: 1px solid #555;
+                border-radius: 4px;
+                font-weight: 600;
+            }}
+            """
+        )
+
+    def current_app_color(self):
+        color = self.db.get_setting("app_color", "#4ade80")
+        if not QColor(color).isValid():
+            color = "#4ade80"
+        return QColor(color).name()
+
+    def choose_app_color(self):
+        initial_color = QColor(self.current_app_color())
+        color = QColorDialog.getColor(
+            initial_color,
+            self,
+            "Выберите цвет приложения",
+        )
+        if not color.isValid():
+            return
+
+        color_name = color.name()
+        self.db.set_setting("app_color", color_name)
+        self.refresh_app_color()
+        self.color_changed.emit(color_name)
+
+    def text_color_for_background(self, color):
+        qcolor = QColor(color)
+        brightness = (
+            qcolor.red() * 0.299
+            + qcolor.green() * 0.587
+            + qcolor.blue() * 0.114
+        )
+        return "#111111" if brightness > 160 else "#ffffff"
 
     def refresh_hotkey_labels(self):
         hotkeys = self.db.get_hotkeys()

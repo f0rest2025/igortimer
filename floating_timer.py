@@ -43,66 +43,7 @@ class FloatingTimer(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         
-        # Stylesheet
-        self.setStyleSheet("""
-            #MainFrame {
-                background-color: rgba(30, 30, 30, 220);
-                border: 1px solid #444;
-                border-radius: 8px;
-            }
-            QLabel {
-                color: #e0e0e0;
-                font-family: 'Segoe UI', sans-serif;
-            }
-            QLineEdit {
-                background-color: rgba(255, 255, 255, 0.1);
-                border: 1px solid #555;
-                color: white;
-                border-radius: 4px;
-                padding: 2px 5px;
-                font-size: 11px;
-            }
-            #TimeLabel {
-                font-size: 20px;
-                font-weight: bold;
-                color: #4ade80; /* Light green */
-                margin-bottom: 2px;
-            }
-            #ClientLabel {
-                font-size: 11px;
-                color: #94a3b8;
-                font-weight: 600;
-            }
-            #StatusLabel {
-                font-size: 10px;
-                color: #64748b;
-                font-style: italic;
-            }
-            #ReminderLabel {
-                font-size: 11px;
-                color: #fbbf24;
-                background-color: rgba(251, 191, 36, 0.1);
-                border-radius: 4px;
-                padding: 4px 6px;
-                margin-top: 4px;
-                font-weight: 500;
-            }
-            QPushButton {
-                background-color: transparent;
-                border: none;
-                color: #cbd5e1;
-                font-size: 14px;
-                padding: 4px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 255, 255, 0.1);
-            }
-            QPushButton#ActionBtn {
-                color: #4ade80;
-                font-weight: bold;
-            }
-        """)
+        self.apply_app_color("#4ade80")
 
         # Layout
         self.main_layout = QVBoxLayout(self)
@@ -195,12 +136,81 @@ class FloatingTimer(QWidget):
         self.reminder_check_timer.timeout.connect(self.check_reminders)
         self.reminder_check_timer.start(5000)
 
+    def apply_app_color(self, color):
+        accent = QColor(color)
+        if not accent.isValid():
+            accent = QColor("#4ade80")
+
+        accent_hex = accent.name()
+        accent_soft = f"rgba({accent.red()}, {accent.green()}, {accent.blue()}, 36)"
+
+        self.setStyleSheet(f"""
+            #MainFrame {
+                background-color: rgba(30, 30, 30, 220);
+                border: 1px solid #444;
+                border-radius: 8px;
+            }
+            QLabel {
+                color: #e0e0e0;
+                font-family: 'Segoe UI', sans-serif;
+            }
+            QLineEdit {
+                background-color: rgba(255, 255, 255, 0.1);
+                border: 1px solid #555;
+                color: white;
+                border-radius: 4px;
+                padding: 2px 5px;
+                font-size: 11px;
+            }
+            #TimeLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: {accent_hex};
+                margin-bottom: 2px;
+            }
+            #ClientLabel {
+                font-size: 11px;
+                color: #94a3b8;
+                font-weight: 600;
+            }
+            #StatusLabel {
+                font-size: 10px;
+                color: #64748b;
+                font-style: italic;
+            }
+            #ReminderLabel {
+                font-size: 11px;
+                color: {accent_hex};
+                background-color: {accent_soft};
+                border-radius: 4px;
+                padding: 4px 6px;
+                margin-top: 4px;
+                font-weight: 500;
+            }
+            QPushButton {
+                background-color: transparent;
+                border: none;
+                color: #cbd5e1;
+                font-size: 14px;
+                padding: 4px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+            QPushButton#ActionBtn {
+                color: {accent_hex};
+                font-weight: bold;
+            }
+        """)
+
     def load_settings(self):
         try:
             opacity = float(self.db.get_setting('opacity', '0.8'))
         except (TypeError, ValueError):
             opacity = 0.8
         self.apply_opacity(opacity)
+        self.apply_app_color(self.db.get_setting('app_color', '#4ade80'))
 
     def apply_opacity(self, opacity):
         self.setWindowOpacity(max(0.3, min(1.0, float(opacity))))
@@ -367,7 +377,22 @@ class FloatingTimer(QWidget):
 
     def show_context_menu(self):
         menu = QMenu(self)
-        menu.setStyleSheet("QMenu { background-color: #2d2d2d; color: white; border: 1px solid #444; }")
+        accent = QColor(self.db.get_setting('app_color', '#4ade80'))
+        if not accent.isValid():
+            accent = QColor("#4ade80")
+        accent_brightness = accent.red() * 0.299 + accent.green() * 0.587 + accent.blue() * 0.114
+        accent_text = "#111111" if accent_brightness > 160 else "#ffffff"
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: #2d2d2d;
+                color: white;
+                border: 1px solid #444;
+            }}
+            QMenu::item:selected {{
+                background-color: {accent.name()};
+                color: {accent_text};
+            }}
+        """)
         
         change_client_act = QAction("Сменить клиента", self)
         change_client_act.triggered.connect(self.enable_client_input)
