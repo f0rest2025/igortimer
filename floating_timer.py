@@ -145,40 +145,40 @@ class FloatingTimer(QWidget):
         accent_soft = f"rgba({accent.red()}, {accent.green()}, {accent.blue()}, 36)"
 
         self.setStyleSheet(f"""
-            #MainFrame {
+            #MainFrame {{
                 background-color: rgba(30, 30, 30, 220);
                 border: 1px solid #444;
                 border-radius: 8px;
-            }
-            QLabel {
+            }}
+            QLabel {{
                 color: #e0e0e0;
                 font-family: 'Segoe UI', sans-serif;
-            }
-            QLineEdit {
+            }}
+            QLineEdit {{
                 background-color: rgba(255, 255, 255, 0.1);
                 border: 1px solid #555;
                 color: white;
                 border-radius: 4px;
                 padding: 2px 5px;
                 font-size: 11px;
-            }
-            #TimeLabel {
+            }}
+            #TimeLabel {{
                 font-size: 20px;
                 font-weight: bold;
                 color: {accent_hex};
                 margin-bottom: 2px;
-            }
-            #ClientLabel {
+            }}
+            #ClientLabel {{
                 font-size: 11px;
                 color: #94a3b8;
                 font-weight: 600;
-            }
-            #StatusLabel {
+            }}
+            #StatusLabel {{
                 font-size: 10px;
                 color: #64748b;
                 font-style: italic;
-            }
-            #ReminderLabel {
+            }}
+            #ReminderLabel {{
                 font-size: 11px;
                 color: {accent_hex};
                 background-color: {accent_soft};
@@ -186,22 +186,22 @@ class FloatingTimer(QWidget):
                 padding: 4px 6px;
                 margin-top: 4px;
                 font-weight: 500;
-            }
-            QPushButton {
+            }}
+            QPushButton {{
                 background-color: transparent;
                 border: none;
                 color: #cbd5e1;
                 font-size: 14px;
                 padding: 4px;
                 border-radius: 4px;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background-color: rgba(255, 255, 255, 0.1);
-            }
-            QPushButton#ActionBtn {
+            }}
+            QPushButton#ActionBtn {{
                 color: {accent_hex};
                 font-weight: bold;
-            }
+            }}
         """)
 
     def load_settings(self):
