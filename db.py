@@ -58,8 +58,15 @@ class Database:
             date_time   DATETIME NOT NULL,
             file_path   TEXT NOT NULL,
             duration    INTEGER DEFAULT 0,
-            file_size   INTEGER DEFAULT 0
+            file_size   INTEGER DEFAULT 0,
+            segment_id  INTEGER
         )''')
+        # Add segment_id to existing DBs that were created before v0.2.1
+        try:
+            cursor.execute("ALTER TABLE recordings ADD COLUMN segment_id INTEGER")
+            self.conn.commit()
+        except Exception:
+            pass  # Column already exists
         
         # Initialize default settings
         default_settings = [
@@ -202,13 +209,16 @@ class Database:
         self.conn.commit()
 
     # --- Recording Methods ---
-    def add_recording(self, client_name: str, file_path: str, duration: int = 0, file_size: int = 0) -> int:
+    def add_recording(self, client_name: str, file_path: str,
+                      duration: int = 0, file_size: int = 0,
+                      segment_id: int = None) -> int:
         """Save a completed screen recording to the database."""
         now = datetime.now().isoformat()
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO recordings (client_name, date_time, file_path, duration, file_size) VALUES (?, ?, ?, ?, ?)",
-            (client_name, now, file_path, duration, file_size)
+            "INSERT INTO recordings (client_name, date_time, file_path, duration, file_size, segment_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (client_name, now, file_path, duration, file_size, segment_id)
         )
         self.conn.commit()
         return cursor.lastrowid
@@ -231,3 +241,17 @@ class Database:
         """Remove a recording entry from the database (does NOT delete the file)."""
         self.conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
         self.conn.commit()
+
+    def get_recordings_for_segment(self, segment_id: int) -> list:
+        """Return recordings that are linked to a specific time segment."""
+        return self.conn.execute(
+            "SELECT * FROM recordings WHERE segment_id = ? ORDER BY date_time ASC",
+            (segment_id,)
+        ).fetchall()
+
+    def get_recordings_for_client_on_date(self, client_name: str, date_str: str) -> list:
+        """Return recordings for a client on a specific date (YYYY-MM-DD)."""
+        return self.conn.execute(
+            "SELECT * FROM recordings WHERE client_name = ? AND date(date_time) = ? ORDER BY date_time ASC",
+            (client_name, date_str)
+        ).fetchall()

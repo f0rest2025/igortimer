@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer, QPoint, Signal, QStringListModel
 from PySide6.QtGui import QAction, QColor, QPalette
+import subprocess, sys, os, socket
 
 from assets import app_icon
 
@@ -12,6 +13,11 @@ class FloatingTimer(QWidget):
     """
     A small, semi-transparent window that stays on top of all other windows.
     """
+    # Work-state signals for auto-sync with recorder
+    work_started  = Signal(str, int)   # client_name, segment_id
+    work_paused   = Signal()
+    work_resumed  = Signal(str, int)   # client_name, segment_id
+    work_stopped  = Signal()
     def __init__(self, db, on_open_settings=None):
         super().__init__()
         self.db = db
@@ -298,6 +304,8 @@ class FloatingTimer(QWidget):
                 self.is_paused = False
                 self.btn_toggle.setText("Ⅱ")
                 self.status_label.setText("В процессе")
+                client_name = self.client_label.text()
+                self.work_resumed.emit(client_name, self.current_segment_id)
             else:
                 # Pause
                 self.db.end_segment(self.current_segment_id)
@@ -305,6 +313,7 @@ class FloatingTimer(QWidget):
                 self.is_paused = True
                 self.btn_toggle.setText("▶")
                 self.status_label.setText("Пауза")
+                self.work_paused.emit()
         else:
             # New Start
             self.current_segment_id = self.db.start_segment(self.current_client_id, "Работа", "work")
@@ -312,6 +321,8 @@ class FloatingTimer(QWidget):
             self.btn_toggle.setText("Ⅱ")
             self.status_label.setText("В процессе")
             self.display_timer.start(1000)
+            client_name = self.client_label.text()
+            self.work_started.emit(client_name, self.current_segment_id)
 
     def toggle_start_stop(self):
         if self.current_segment_id:
@@ -332,6 +343,7 @@ class FloatingTimer(QWidget):
         self.status_label.setText("Завершено")
         self.seconds_elapsed = 0
         self.time_label.setText("00:00:00")
+        self.work_stopped.emit()
 
     def pick_client(self):
         # Override pick_client to use our new inline system
@@ -491,24 +503,43 @@ class FloatingTimer(QWidget):
             self.on_open_settings()
 
     def open_recordings_search(self):
-        """Launch Streamlit app via main app's handler, or directly if available."""
-        import sys, os, subprocess
+        """Open Streamlit recordings UI. Ensures only ONE instance is running."""
+        import os, sys, subprocess, socket, webbrowser, time
+
         base_dir = os.path.dirname(os.path.abspath(__file__))
         app_script = os.path.join(base_dir, "app.py")
+        url = "http://localhost:8501"
+
+        def _port_open(port: int) -> bool:
+            """Return True if something is already listening on the port."""
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                return s.connect_ex(("127.0.0.1", port)) == 0
+
+        if _port_open(8501):
+            # Streamlit already running — just open browser
+            webbrowser.open(url)
+            return
+
         if not os.path.exists(app_script):
             from PySide6.QtWidgets import QMessageBox
-            QMessageBox.information(self, "Streamlit", "app.py не найден.")
+            QMessageBox.information(self, "Поиск записей", "app.py не найден.")
             return
+
         try:
             subprocess.Popen(
                 [sys.executable, "-m", "streamlit", "run", app_script,
-                 "--server.headless", "false"],
+                 "--server.headless", "false",
+                 "--server.port", "8501"],
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 cwd=base_dir,
             )
+            # Brief pause for Streamlit to bind port, then open browser
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(2500, lambda: webbrowser.open(url))
         except Exception as e:
             from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Streamlit", f"Ошибка: {e}")
+            QMessageBox.warning(self, "Streamlit", f"Ошибка запуска: {e}")
 
     def quit_app(self):
         from PySide6.QtWidgets import QApplication

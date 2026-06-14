@@ -241,6 +241,7 @@ class ScreenRecorder(QObject):
         self._segments: list[str] = []       # completed segment paths
         self._final_path: str = ""
         self._start_time: Optional[datetime] = None
+        self._segment_id: Optional[int] = None   # linked time_segment id
         self._segment_worker: Optional[_SegmentWorker] = None
 
         # Audio config cached at session start
@@ -263,13 +264,14 @@ class ScreenRecorder(QObject):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def start_recording(self, client_name: str):
-        """Start a fresh recording session."""
+    def start_recording(self, client_name: str, segment_id: int = None):
+        """Start a fresh recording session. Optionally link to a timer segment_id."""
         if self._state != RecordingState.IDLE:
             self.status_changed.emit("⚠ Сначала остановите текущую запись")
             return
 
         self._client_name = client_name.strip() or "Без_имени"
+        self._segment_id = segment_id
         self._start_time = datetime.now()
         self._segments = []
         self._final_path = self._build_final_path(self._client_name)
@@ -410,6 +412,7 @@ class ScreenRecorder(QObject):
             file_path=os.path.abspath(output),
             duration=duration,
             file_size=file_size,
+            segment_id=self._segment_id,
         )
 
         self._state = RecordingState.IDLE

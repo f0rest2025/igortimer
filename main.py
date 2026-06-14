@@ -71,6 +71,36 @@ def main():
     recorder.recording_error.connect(on_recording_error)
     recorder.status_changed.connect(on_recorder_status)
 
+    # --- Auto-sync: timer ↔ recorder ---
+    def on_work_started(client_name: str, segment_id: int):
+        """Timer just started → silently start recording (no dialog)."""
+        if not recorder.is_recording:
+            recorder.start_recording(client_name, segment_id=segment_id)
+
+    def on_work_paused():
+        """Timer paused → pause recording."""
+        if recorder.is_recording and not recorder.is_paused:
+            recorder.pause_recording()
+
+    def on_work_resumed(client_name: str, segment_id: int):
+        """Timer resumed → resume recording (or start fresh if was stopped)."""
+        if recorder.is_paused:
+            # Update segment_id to the new resume segment
+            recorder._segment_id = segment_id
+            recorder.resume_recording()
+        elif not recorder.is_recording:
+            recorder.start_recording(client_name, segment_id=segment_id)
+
+    def on_work_stopped():
+        """Timer stopped → stop and save recording."""
+        if recorder.is_recording:
+            recorder.stop_recording()
+
+    timer_window.work_started.connect(on_work_started)
+    timer_window.work_paused.connect(on_work_paused)
+    timer_window.work_resumed.connect(on_work_resumed)
+    timer_window.work_stopped.connect(on_work_stopped)
+
     # 4. Crash Recovery Check
     open_seg = db.get_open_segment()
     if open_seg:
