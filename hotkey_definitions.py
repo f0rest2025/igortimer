@@ -1,10 +1,15 @@
 HOTKEY_ACTIONS = [
     ("toggle_timer", "Старт / стоп таймера"),
-    ("pause_timer", "Пауза / продолжить"),
+    ("pause_timer", "Пауза / продолжить таймер"),
     ("add_note", "Добавить заметку"),
     ("add_reminder", "Добавить напоминание"),
     ("change_client", "Сменить клиента"),
     ("open_journal", "Открыть журнал"),
+    # --- Запись экрана ---
+    ("toggle_recording", "Запись: Старт новой сессии"),
+    ("pause_recording",  "Запись: Пауза / продолжить"),
+    ("stop_recording",   "Запись: Остановить и сохранить"),
+    ("open_recordings",  "Запись: Открыть поиск"),
 ]
 
 HOTKEY_ACTIONS.extend(
@@ -13,12 +18,17 @@ HOTKEY_ACTIONS.extend(
 )
 
 DEFAULT_HOTKEYS = {
-    "toggle_timer": "<ctrl>+<alt>+s",
-    "pause_timer": "<ctrl>+<alt>+<space>",
-    "add_note": "<ctrl>+<alt>+n",
-    "add_reminder": "<ctrl>+<alt>+r",
-    "change_client": "<ctrl>+<alt>+c",
-    "open_journal": "<ctrl>+<alt>+j",
+    "toggle_timer":    "<ctrl>+<alt>+s",
+    "pause_timer":     "<ctrl>+<alt>+<space>",
+    "add_note":        "<ctrl>+<alt>+n",
+    "add_reminder":    "<ctrl>+<alt>+r",
+    "change_client":   "<ctrl>+<alt>+c",
+    "open_journal":    "<ctrl>+<alt>+j",
+    # Recording
+    "toggle_recording": "<ctrl>+<alt>+w",
+    "pause_recording":  "<ctrl>+<alt>+p",
+    "stop_recording":   "<ctrl>+<alt>+e",
+    "open_recordings":  "<ctrl>+<alt>+f",
     **{
         f"switch_client_{index}": f"<ctrl>+<alt>+{index}"
         for index in range(1, 10)

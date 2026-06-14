@@ -50,6 +50,16 @@ class Database:
             remind_at TIMESTAMP NOT NULL,
             is_done INTEGER DEFAULT 0
         )''')
+
+        # Recordings of screen sessions
+        cursor.execute('''CREATE TABLE IF NOT EXISTS recordings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT NOT NULL,
+            date_time   DATETIME NOT NULL,
+            file_path   TEXT NOT NULL,
+            duration    INTEGER DEFAULT 0,
+            file_size   INTEGER DEFAULT 0
+        )''')
         
         # Initialize default settings
         default_settings = [
@@ -189,4 +199,35 @@ class Database:
 
     def mark_reminder_done(self, reminder_id):
         self.conn.execute("UPDATE reminders SET is_done = 1 WHERE id = ?", (reminder_id,))
+        self.conn.commit()
+
+    # --- Recording Methods ---
+    def add_recording(self, client_name: str, file_path: str, duration: int = 0, file_size: int = 0) -> int:
+        """Save a completed screen recording to the database."""
+        now = datetime.now().isoformat()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO recordings (client_name, date_time, file_path, duration, file_size) VALUES (?, ?, ?, ?, ?)",
+            (client_name, now, file_path, duration, file_size)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_recordings(self, limit: int = 500) -> list:
+        """Return all recordings ordered newest-first."""
+        return self.conn.execute(
+            "SELECT * FROM recordings ORDER BY date_time DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+
+    def search_recordings(self, query: str) -> list:
+        """Search recordings by client name (case-insensitive substring)."""
+        return self.conn.execute(
+            "SELECT * FROM recordings WHERE LOWER(client_name) LIKE LOWER(?) ORDER BY date_time DESC",
+            (f"%{query}%",)
+        ).fetchall()
+
+    def delete_recording(self, recording_id: int):
+        """Remove a recording entry from the database (does NOT delete the file)."""
+        self.conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
         self.conn.commit()

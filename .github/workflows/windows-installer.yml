@@ -13,10 +13,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
@@ -41,7 +41,7 @@ jobs:
 
       - name: Validate Python sources
         shell: pwsh
-        run: python -m compileall .
+        run: python -m compileall -q .
 
       - name: Build desktop executable
         shell: pwsh
@@ -52,7 +52,12 @@ jobs:
             --windowed `
             --name igortimer `
             --collect-all pynput `
+            --collect-all streamlit `
+            --collect-all screeninfo `
             --add-data "logo.png;." `
+            --add-data "recorder.py;." `
+            --add-data "recorder_dialog.py;." `
+            --add-data "app.py;." `
             --icon logo.ico `
             main.py
 
@@ -68,8 +73,51 @@ jobs:
             installer\windows.iss
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: igortimer-setup-${{ env.APP_VERSION }}
           path: dist/installer/*.exe
           if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.APP_VERSION }}
+          name: "IgorTimer v${{ env.APP_VERSION }} — Screen Recorder"
+          body: |
+            ## 🎬 Что нового в v${{ env.APP_VERSION }}
+
+            ### Запись экрана
+            - Запись всего рабочего стола (авто-определение мониторов, включая двойной)
+            - Системный звук через WASAPI loopback (весь звук Windows без настройки)
+            - Микрофон подмешивается автоматически, если доступен
+            - Поддержка **Паузы/Возобновления** через мульти-сегментную архитектуру
+            - Сжатие H.264, CRF 28, 15 FPS — баланс качество/размер
+
+            ### Горячие клавиши записи
+            | Действие | По умолчанию |
+            |---|---|
+            | Начать запись | `Ctrl+Alt+W` |
+            | Пауза / Продолжить | `Ctrl+Alt+P` |
+            | Остановить и сохранить | `Ctrl+Alt+E` |
+            | Открыть поиск | `Ctrl+Alt+F` |
+
+            > Все хоткеи переназначаются в Настройках.
+
+            ### Веб-интерфейс поиска (Streamlit)
+            - Запуск: `streamlit run app.py` или `Ctrl+Alt+F`
+            - Поиск по имени клиента, фильтр по датам
+            - Встроенный HTML5-плеер — смотрите записи прямо в браузере
+            - Статистика по времени и размеру
+
+            ### Структура записей
+            ```
+            recordings/
+            └── YYYY-MM-DD/
+                └── HH-MM_ИмяКлиента.mp4
+            ```
+          files: dist/installer/*.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

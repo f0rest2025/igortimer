@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtCore import Qt
 
@@ -10,6 +11,8 @@ from idle_detector import IdleDetector
 from hotkeys import GlobalHotkeyManager
 from journal_window import JournalWindow
 from settings_window import SettingsWindow
+from recorder import ScreenRecorder
+from recorder_dialog import RecorderDialog
 
 def main():
     # 1. Initialize App
@@ -42,6 +45,31 @@ def main():
 
     timer_window = FloatingTimer(db, on_open_settings=show_settings)
     journal_window = JournalWindow(db)
+
+    # --- Screen Recorder ---
+    recordings_dir = os.path.join(base_dir, "recordings")
+    recorder = ScreenRecorder(db, recordings_dir=recordings_dir)
+
+    def on_recording_started(client_name: str):
+        timer_window.set_recording_status(True, client_name)
+
+    def on_recording_stopped(file_path: str, duration: int):
+        timer_window.set_recording_status(False)
+
+    def on_recording_error(msg: str):
+        timer_window.set_recording_status(False)
+        QMessageBox.warning(
+            None, "Ошибка записи",
+            f"Не удалось записать экран:\n\n{msg}"
+        )
+
+    def on_recorder_status(msg: str):
+        timer_window.show_recorder_status(msg)
+
+    recorder.recording_started.connect(on_recording_started)
+    recorder.recording_stopped.connect(on_recording_stopped)
+    recorder.recording_error.connect(on_recording_error)
+    recorder.status_changed.connect(on_recorder_status)
 
     # 4. Crash Recovery Check
     open_seg = db.get_open_segment()
@@ -91,6 +119,34 @@ def main():
             journal_window.show()
             journal_window.raise_()
             journal_window.activateWindow()
+        elif action == 'toggle_recording':
+            if recorder.is_recording:
+                # Already recording — show hint instead of accidental stop
+                timer_window.show_recorder_status("⚠ Используйте Ctrl+Alt+E для остановки")
+            else:
+                # Pre-fill with current timer client name if active
+                prefill = ""
+                if timer_window.current_client_id:
+                    prefill = timer_window.client_label.text()
+                dlg = RecorderDialog(db, current_client_name=prefill)
+                if dlg.exec():
+                    recorder.start_recording(dlg.client_name)
+        elif action == 'pause_recording':
+            if recorder.is_paused:
+                recorder.resume_recording()
+                timer_window.set_recording_status(True, recorder._client_name)
+            elif recorder.is_recording:
+                recorder.pause_recording()
+                timer_window.set_recording_status(True, recorder._client_name, paused=True)
+            else:
+                timer_window.show_recorder_status("Запись не активна")
+        elif action == 'stop_recording':
+            if recorder.is_recording:
+                recorder.stop_recording()
+            else:
+                timer_window.show_recorder_status("Запись не активна")
+        elif action == 'open_recordings':
+            _open_streamlit(base_dir)
         elif action.startswith('switch_client_'):
             idx = int(action.split('_')[-1]) - 1
             clients = db.get_clients()
@@ -103,6 +159,22 @@ def main():
                 if timer_window.current_segment_id:
                     timer_window.stop_work()
                     timer_window.toggle_work()
+
+    def _open_streamlit(base_dir: str):
+        """Launch Streamlit search app in background and open browser."""
+        app_script = os.path.join(base_dir, "app.py")
+        if not os.path.exists(app_script):
+            QMessageBox.information(None, "Streamlit", "app.py не найден. Убедитесь, что app.py находится рядом с main.py.")
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "streamlit", "run", app_script,
+                 "--server.headless", "false"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                cwd=base_dir,
+            )
+        except Exception as e:
+            QMessageBox.warning(None, "Streamlit", f"Не удалось запустить Streamlit:\n{e}")
 
     def start_hotkey_manager():
         nonlocal hotkey_manager
@@ -125,10 +197,12 @@ def main():
 
     # 6. Final cleanup on exit
     def cleanup():
-        print("Stopping threads and saving data...")
+        print("Станавливаю потоки и сохраняю данные...")
         idle_thread.stop()
         if hotkey_manager:
             hotkey_manager.stop()
+        if recorder.is_recording:
+            recorder.stop_recording()
         timer_window.stop_work()
 
     app.aboutToQuit.connect(cleanup)

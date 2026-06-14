@@ -126,10 +126,20 @@ class FloatingTimer(QWidget):
         self.reminder_label.hide()
         self.frame_layout.addWidget(self.reminder_label)
 
+        # Recording indicator
+        self.rec_label = QLabel("")
+        self.rec_label.setObjectName("RecLabel")
+        self.rec_label.setAlignment(Qt.AlignCenter)
+        self.rec_label.hide()
+        self.frame_layout.addWidget(self.rec_label)
+
         self.main_layout.addWidget(self.frame)
 
         self.setFixedSize(160, 140) # Slightly larger default
         self.active_reminder = None
+        self._rec_blink_state = False
+        self._rec_blink_timer = QTimer(self)
+        self._rec_blink_timer.timeout.connect(self._blink_rec)
 
         # Reminder Check Timer
         self.reminder_check_timer = QTimer(self)
@@ -201,6 +211,15 @@ class FloatingTimer(QWidget):
             QPushButton#ActionBtn {{
                 color: {accent_hex};
                 font-weight: bold;
+            }}
+            #RecLabel {{
+                font-size: 10px;
+                color: #ff4444;
+                font-weight: bold;
+                background-color: rgba(255, 68, 68, 0.12);
+                border-radius: 3px;
+                padding: 2px 5px;
+                margin-top: 2px;
             }}
         """)
 
@@ -375,6 +394,41 @@ class FloatingTimer(QWidget):
             self.setFixedSize(160, 140) # Shrink back
             self.status_label.setText("Готов")
 
+    # --- Recording Status ---
+
+    def set_recording_status(self, is_recording: bool, client_name: str = "", paused: bool = False):
+        """Show/hide the REC indicator and resize the window."""
+        if is_recording:
+            if paused:
+                self.rec_label.setText(f"⏸ ПАУЗА  {client_name}")
+                self.rec_label.setStyleSheet(
+                    "color: #f59e0b; background-color: rgba(245,158,11,0.12);"
+                    "border-radius:3px; padding:2px 5px; font-size:10px; font-weight:bold;"
+                )
+                self._rec_blink_timer.stop()
+                self.rec_label.setVisible(True)
+            else:
+                self.rec_label.setText(f"⏺ REC  {client_name}")
+                self.rec_label.setStyleSheet("")   # reset to #RecLabel stylesheet
+                self._rec_blink_timer.start(800)
+            self.rec_label.show()
+            if not self.active_reminder:
+                self.setFixedSize(160, 165)
+        else:
+            self._rec_blink_timer.stop()
+            self.rec_label.hide()
+            if not self.active_reminder:
+                self.setFixedSize(160, 140)
+
+    def show_recorder_status(self, msg: str):
+        """Show a transient recorder status in the status label."""
+        self.status_label.setText(msg)
+
+    def _blink_rec(self):
+        """Toggle REC label visibility for a blinking effect."""
+        self._rec_blink_state = not self._rec_blink_state
+        self.rec_label.setVisible(self._rec_blink_state)
+
     def show_context_menu(self):
         menu = QMenu(self)
         accent = QColor(self.db.get_setting('app_color', '#4ade80'))
@@ -403,6 +457,9 @@ class FloatingTimer(QWidget):
         journal_act = QAction("Открыть журнал", self)
         journal_act.triggered.connect(self.show_journal)
 
+        recordings_act = QAction("🔍 Поиск записей (Streamlit)", self)
+        recordings_act.triggered.connect(self.open_recordings_search)
+
         settings_act = QAction("Настройки", self)
         settings_act.triggered.connect(self.open_settings)
         
@@ -412,6 +469,7 @@ class FloatingTimer(QWidget):
         menu.addAction(change_client_act)
         menu.addAction(add_reminder_act)
         menu.addAction(journal_act)
+        menu.addAction(recordings_act)
         menu.addAction(settings_act)
         menu.addSeparator()
         menu.addAction(exit_act)
@@ -431,6 +489,26 @@ class FloatingTimer(QWidget):
     def open_settings(self):
         if self.on_open_settings:
             self.on_open_settings()
+
+    def open_recordings_search(self):
+        """Launch Streamlit app via main app's handler, or directly if available."""
+        import sys, os, subprocess
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        app_script = os.path.join(base_dir, "app.py")
+        if not os.path.exists(app_script):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Streamlit", "app.py не найден.")
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "streamlit", "run", app_script,
+                 "--server.headless", "false"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                cwd=base_dir,
+            )
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Streamlit", f"Ошибка: {e}")
 
     def quit_app(self):
         from PySide6.QtWidgets import QApplication

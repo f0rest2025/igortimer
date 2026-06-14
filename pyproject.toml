@@ -1,11 +1,14 @@
 [project]
 name = "igortimer"
-version = "0.1.0"
-description = "Desktop billable time tracker with a floating timer window."
+version = "0.2.0"
+description = "Desktop billable time tracker with floating timer, idle detection, screen recording, and SQLite persistence."
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.5.0",
     "openpyxl>=3.1.0",
     "pynput>=1.7.6",
     "darkdetect>=0.8.0",
+    "streamlit>=1.35.0",
+    "screeninfo>=0.8.1",
+    "pandas>=2.0.0",
 ]
