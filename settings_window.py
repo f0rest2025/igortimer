@@ -1,12 +1,16 @@
+import os
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QKeyEvent
 from PySide6.QtWidgets import (
     QColorDialog,
     QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -73,6 +77,7 @@ class SettingsWindow(QDialog):
         self.refresh_opacity()
         self.refresh_app_color()
         self.refresh_hotkey_labels()
+        self.refresh_recordings_dir()
 
     def init_ui(self):
         root_layout = QVBoxLayout(self)
@@ -112,6 +117,34 @@ class SettingsWindow(QDialog):
         window_layout.addWidget(self.color_button, 1, 2)
 
         root_layout.addWidget(window_frame)
+
+        # ── Recordings Storage ────────────────────────────────────────────────
+        rec_title = QLabel("Записи экрана")
+        rec_title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        root_layout.addWidget(rec_title)
+
+        rec_frame = QFrame()
+        rec_frame.setFrameShape(QFrame.StyledPanel)
+        rec_layout = QGridLayout(rec_frame)
+        rec_layout.setColumnStretch(1, 1)
+
+        rec_layout.addWidget(QLabel("Папка хранения:"), 0, 0)
+
+        self.recordings_dir_edit = QLineEdit()
+        self.recordings_dir_edit.setReadOnly(True)
+        self.recordings_dir_edit.setPlaceholderText("Папка не выбрана")
+        rec_layout.addWidget(self.recordings_dir_edit, 0, 1)
+
+        browse_btn = QPushButton("Выбрать...")
+        browse_btn.clicked.connect(self.choose_recordings_dir)
+        rec_layout.addWidget(browse_btn, 0, 2)
+
+        reset_dir_btn = QPushButton("По умолчанию")
+        reset_dir_btn.setToolTip("Сбросить к папке recordings/ рядом с приложением")
+        reset_dir_btn.clicked.connect(self.reset_recordings_dir)
+        rec_layout.addWidget(reset_dir_btn, 0, 3)
+
+        root_layout.addWidget(rec_frame)
 
         title = QLabel("Горячие клавиши")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -337,7 +370,39 @@ class SettingsWindow(QDialog):
         self.refresh_hotkey_labels()
         self.hotkeys_changed.emit()
 
+    # ── Recordings Directory ──────────────────────────────────────────
+
+    def _default_recordings_dir(self) -> str:
+        base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, "recordings")
+
+    def refresh_recordings_dir(self):
+        path = self.db.get_setting("recordings_dir", "")
+        if not path:
+            path = self._default_recordings_dir()
+        self.recordings_dir_edit.setText(path)
+
+    def choose_recordings_dir(self):
+        current = self.recordings_dir_edit.text() or self._default_recordings_dir()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку для хранения записей", current
+        )
+        if folder:
+            self.db.set_setting("recordings_dir", folder)
+            self.recordings_dir_edit.setText(folder)
+            QMessageBox.information(
+                self, "Папка сохранена",
+                f"Записи будут сохраняться в:\n{folder}\n\n"
+                "Изменение вступит в силу для следующей записи."
+            )
+
+    def reset_recordings_dir(self):
+        default = self._default_recordings_dir()
+        self.db.set_setting("recordings_dir", "")
+        self.recordings_dir_edit.setText(default)
+
     def closeEvent(self, event):
         if self.recording_action:
             self.finish_recording()
         super().closeEvent(event)
+

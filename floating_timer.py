@@ -118,6 +118,16 @@ class FloatingTimer(QWidget):
         self.controls_layout.addWidget(self.btn_toggle)
         self.controls_layout.addWidget(self.btn_stop)
         self.controls_layout.addWidget(self.btn_note)
+
+        # REC dot — inline, between note and menu, always present, hidden when idle
+        self.rec_dot = QLabel("⏺")
+        self.rec_dot.setObjectName("RecDot")
+        self.rec_dot.setFixedWidth(18)
+        self.rec_dot.setAlignment(Qt.AlignCenter)
+        self.rec_dot.setToolTip("Запись активна")
+        self.rec_dot.hide()
+        self.controls_layout.addWidget(self.rec_dot)
+
         self.controls_layout.addWidget(self.btn_menu)
         
         self.frame_layout.addWidget(self.controls_widget)
@@ -132,16 +142,9 @@ class FloatingTimer(QWidget):
         self.reminder_label.hide()
         self.frame_layout.addWidget(self.reminder_label)
 
-        # Recording indicator
-        self.rec_label = QLabel("")
-        self.rec_label.setObjectName("RecLabel")
-        self.rec_label.setAlignment(Qt.AlignCenter)
-        self.rec_label.hide()
-        self.frame_layout.addWidget(self.rec_label)
-
         self.main_layout.addWidget(self.frame)
 
-        self.setFixedSize(160, 140) # Slightly larger default
+        self.setFixedSize(160, 140)  # Fixed forever — REC dot is inline, no height jump
         self.active_reminder = None
         self._rec_blink_state = False
         self._rec_blink_timer = QTimer(self)
@@ -218,14 +221,11 @@ class FloatingTimer(QWidget):
                 color: {accent_hex};
                 font-weight: bold;
             }}
-            #RecLabel {{
-                font-size: 10px;
+            #RecDot {{
+                font-size: 11px;
                 color: #ff4444;
                 font-weight: bold;
-                background-color: rgba(255, 68, 68, 0.12);
-                border-radius: 3px;
-                padding: 2px 5px;
-                margin-top: 2px;
+                padding: 0px 1px;
             }}
         """)
 
@@ -409,37 +409,35 @@ class FloatingTimer(QWidget):
     # --- Recording Status ---
 
     def set_recording_status(self, is_recording: bool, client_name: str = "", paused: bool = False):
-        """Show/hide the REC indicator and resize the window."""
+        """Update the inline REC dot. Window size never changes."""
         if is_recording:
+            self.rec_dot.show()
             if paused:
-                self.rec_label.setText(f"⏸ ПАУЗА  {client_name}")
-                self.rec_label.setStyleSheet(
-                    "color: #f59e0b; background-color: rgba(245,158,11,0.12);"
-                    "border-radius:3px; padding:2px 5px; font-size:10px; font-weight:bold;"
-                )
+                # Steady amber dot — paused
+                self.rec_dot.setText("⏸")
+                self.rec_dot.setStyleSheet("color: #f59e0b;")
+                self.rec_dot.setToolTip(f"Пауза записи: {client_name}")
                 self._rec_blink_timer.stop()
-                self.rec_label.setVisible(True)
+                self._rec_blink_state = True
             else:
-                self.rec_label.setText(f"⏺ REC  {client_name}")
-                self.rec_label.setStyleSheet("")   # reset to #RecLabel stylesheet
+                # Blinking red dot — recording
+                self.rec_dot.setText("⏺")
+                self.rec_dot.setStyleSheet("color: #ff4444;")
+                self.rec_dot.setToolTip(f"Запись: {client_name}")
                 self._rec_blink_timer.start(800)
-            self.rec_label.show()
-            if not self.active_reminder:
-                self.setFixedSize(160, 165)
         else:
             self._rec_blink_timer.stop()
-            self.rec_label.hide()
-            if not self.active_reminder:
-                self.setFixedSize(160, 140)
+            self.rec_dot.hide()
 
     def show_recorder_status(self, msg: str):
         """Show a transient recorder status in the status label."""
         self.status_label.setText(msg)
 
     def _blink_rec(self):
-        """Toggle REC label visibility for a blinking effect."""
+        """Toggle REC dot opacity for blinking effect."""
         self._rec_blink_state = not self._rec_blink_state
-        self.rec_label.setVisible(self._rec_blink_state)
+        self.rec_dot.setVisible(self._rec_blink_state)
+
 
     def show_context_menu(self):
         menu = QMenu(self)

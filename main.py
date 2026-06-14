@@ -47,7 +47,8 @@ def main():
     journal_window = JournalWindow(db)
 
     # --- Screen Recorder ---
-    recordings_dir = os.path.join(base_dir, "recordings")
+    _default_rec_dir = os.path.join(base_dir, "recordings")
+    recordings_dir = db.get_setting("recordings_dir", "") or _default_rec_dir
     recorder = ScreenRecorder(db, recordings_dir=recordings_dir)
 
     def on_recording_started(client_name: str):
