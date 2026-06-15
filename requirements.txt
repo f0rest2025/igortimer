@@ -5,3 +5,4 @@ darkdetect>=0.8.0
 streamlit>=1.35.0
 screeninfo>=0.8.1
 pandas>=2.0.0
+pyaudiowpatch>=0.2.12

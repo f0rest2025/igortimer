@@ -1,34 +1,28 @@
 """
 recorder.py — Screen & Audio Recorder Module
 =============================================
-Records the full desktop (all monitors combined) + system audio using FFmpeg.
+Records the full desktop (all monitors combined) + system audio using FFmpeg
+for video and PyAudioWPatch (WASAPI loopback) for audio.
 
 Architecture:
   - Recording is split into SEGMENTS to support Pause/Resume
-  - On Pause: current FFmpeg process is stopped gracefully → segment saved
-  - On Resume: new FFmpeg process started → new segment file
-  - On Stop: all segments concatenated into one final MP4 via ffmpeg concat
+  - Each segment: FFmpeg records VIDEO only, _AudioCaptureThread records AUDIO
+    to a parallel WAV file.
+  - On Pause: both processes stop → segment pair (mp4+wav) saved
+  - On Resume: new segment pair started
+  - On Stop: video segments concatenated, audio WAV files concatenated,
+    then ffmpeg muxes final video+audio into one MP4.
   - Final file is logged to SQLite
 
-Audio strategy (priority order, Windows):
-  1. WASAPI loopback  (-f wasapi -loopback 1)      ← captures ALL Windows audio
-  2. dshow Stereo Mix (-f dshow -i audio="...")     ← fallback for older setups
-  3. No audio                                        ← last resort, still records
-
-Microphone: optional bonus. Added as a second audio track and mixed in.
-If mic is absent/muted — recording continues without interruption.
+Audio strategy (Windows):
+  1. pyaudiowpatch WASAPI loopback  ← captures ALL Windows audio (speakers)
+  2. No audio                         ← last resort if PyAudio unavailable
 
 Signals (all Qt-thread-safe):
   recording_started(client_name)
   recording_stopped(file_path, duration_seconds)
   recording_error(error_message)
   status_changed(short_ui_text)
-
-Usage from main thread:
-  recorder.start_recording("Client Name")
-  recorder.pause_recording()
-  recorder.resume_recording()
-  recorder.stop_recording()
 """
 
 from __future__ import annotations
@@ -38,9 +32,11 @@ import re
 import sys
 import json
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
+import wave
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -86,50 +82,84 @@ def get_virtual_screen_geometry() -> tuple[int, int, int, int]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Audio device probing
+# Audio capture via PyAudioWPatch (WASAPI loopback)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def list_dshow_audio_devices() -> list[str]:
-    """Return list of DirectShow audio device names available on this system."""
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+def get_wasapi_loopback_device():
+    """Return (device_info_dict, PyAudio_instance) for the default WASAPI loopback.
+    Returns (None, None) if pyaudiowpatch is unavailable."""
     try:
-        result = subprocess.run(
-            [ffmpeg, "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=10,
-        )
-        output = result.stderr
-        devices: list[str] = []
-        in_audio = False
-        for line in output.splitlines():
-            if "DirectShow audio devices" in line:
-                in_audio = True
-                continue
-            if in_audio:
-                m = re.search(r'"([^"]+)"', line)
-                if m and "Alternative name" not in line:
-                    devices.append(m.group(1))
-        return devices
+        import pyaudiowpatch as pyaudio
+        p = pyaudio.PyAudio()
+        device = p.get_default_wasapi_loopback()
+        return device, p
     except Exception as e:
-        print(f"[Recorder] dshow probe error: {e}", file=sys.stderr)
-        return []
+        print(f"[Recorder] WASAPI loopback unavailable: {e}", file=sys.stderr)
+        return None, None
 
 
-def test_wasapi_loopback() -> bool:
-    """Quick-check whether FFmpeg can open WASAPI loopback on this machine."""
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-    try:
-        result = subprocess.run(
-            [ffmpeg, "-f", "wasapi", "-loopback", "1",
-             "-i", "default", "-t", "0.1", "-f", "null", "-"],
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=8,
-        )
-        # If it doesn't say "Error" in the first line about opening device it's OK
-        return "avformat_open_input" not in result.stderr and result.returncode in (0, 1)
-    except Exception:
-        return False
+class _AudioCaptureThread(threading.Thread):
+    """
+    Captures WASAPI loopback audio to a WAV file in a background thread.
+    """
+    def __init__(self, output_path: str):
+        super().__init__(daemon=True)
+        self.output_path = output_path
+        self._stop_event = threading.Event()
+        self.ok = False
+        self._channels = 2
+        self._rate = 48000
 
+    def run(self):
+        try:
+            import pyaudiowpatch as pyaudio
+            p = pyaudio.PyAudio()
+            device = p.get_default_wasapi_loopback()
+            self._channels = device["maxInputChannels"]
+            self._rate = int(device["defaultSampleRate"])
+            frames_per_buf = 1024
+
+            with wave.open(self.output_path, "wb") as wf:
+                wf.setnchannels(self._channels)
+                wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
+                wf.setframerate(self._rate)
+
+                def callback(in_data, frame_count, time_info, status):
+                    if self._stop_event.is_set():
+                        return (b"\x00" * len(in_data), pyaudio.paComplete)
+                    wf.writeframes(in_data)
+                    return (None, pyaudio.paContinue)
+
+                stream = p.open(
+                    format=pyaudio.paInt16,
+                    channels=self._channels,
+                    rate=self._rate,
+                    frames_per_buffer=frames_per_buf,
+                    input=True,
+                    input_device_index=device["index"],
+                    stream_callback=callback,
+                )
+                stream.start_stream()
+                while not self._stop_event.is_set() and stream.is_active():
+                    threading.Event().wait(0.1)
+                stream.stop_stream()
+                stream.close()
+
+            p.terminate()
+            self.ok = os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 44
+            if self.ok:
+                print(f"[Recorder] Audio WAV saved: {self.output_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[Recorder] Audio capture error: {e}", file=sys.stderr)
+            self.ok = False
+
+    def stop(self):
+        self._stop_event.set()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Misc helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def get_video_duration(file_path: str) -> int:
     """Use ffprobe to get video duration in whole seconds."""
@@ -159,22 +189,22 @@ class RecordingState:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Segment worker (one FFmpeg process per segment)
+# Segment worker (one FFmpeg VIDEO process + one audio thread per segment)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _SegmentWorker(QThread):
     """
-    Runs a single FFmpeg process for one recording segment.
-    Emits finished(segment_path, ok) when done.
+    Runs FFmpeg (video only) + _AudioCaptureThread in parallel for one segment.
+    Emits finished(video_segment_path, audio_wav_path, ok) when done.
     """
-    finished = Signal(str, bool)
+    finished = Signal(str, str, bool)   # video_path, audio_path, ok
 
-    def __init__(self, cmd: list[str], segment_path: str):
+    def __init__(self, cmd: list[str], segment_path: str, audio_path: str):
         super().__init__()
         self.cmd = cmd
         self.segment_path = segment_path
+        self.audio_path = audio_path
         self._process: Optional[subprocess.Popen] = None
-
     def run(self):
         try:
             self._process = subprocess.Popen(
@@ -237,16 +267,13 @@ class ScreenRecorder(QObject):
 
         self._state = RecordingState.IDLE
         self._client_name: str = ""
-        self._session_dir: str = ""          # temp dir for segments
-        self._segments: list[str] = []       # completed segment paths
+        self._session_dir: str = ""              # temp dir for segments
+        self._segments: list[tuple[str, str]] = []  # (video_mp4, audio_wav) pairs
         self._final_path: str = ""
         self._start_time: Optional[datetime] = None
         self._segment_id: Optional[int] = None   # linked time_segment id
         self._segment_worker: Optional[_SegmentWorker] = None
-
-        # Audio config cached at session start
-        self._audio_cmd_parts: list[str] = []
-        self._audio_map_parts: list[str] = []
+        self._has_audio: bool = False            # True when pyaudiowpatch is available
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -276,12 +303,19 @@ class ScreenRecorder(QObject):
         self._segments = []
         self._final_path = self._build_final_path(self._client_name)
 
-        # Create temp session dir for segment files
+        # Create temp session dir
         os.makedirs(os.path.dirname(self._final_path), exist_ok=True)
         self._session_dir = tempfile.mkdtemp(prefix="rec_seg_")
 
-        # Probe and cache audio devices ONCE per session
-        self._probe_audio()
+        # Check pyaudiowpatch availability once per session
+        dev, pa = get_wasapi_loopback_device()
+        if pa:
+            pa.terminate()
+        self._has_audio = dev is not None
+        if self._has_audio:
+            print("[Recorder] Audio: WASAPI loopback via pyaudiowpatch ✓", file=sys.stderr)
+        else:
+            print("[Recorder] Audio: NOT available — recording video only", file=sys.stderr)
 
         self._state = RecordingState.RECORDING
         self.recording_started.emit(self._client_name)
@@ -320,9 +354,13 @@ class ScreenRecorder(QObject):
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _launch_segment(self):
-        """Build FFmpeg command for the next segment and start worker."""
+        """Build FFmpeg VIDEO command + audio WAV path for the next segment."""
         seg_index = len(self._segments)
         seg_path = os.path.join(self._session_dir, f"segment_{seg_index:03d}.mp4")
+        audio_path = (
+            os.path.join(self._session_dir, f"audio_{seg_index:03d}.wav")
+            if self._has_audio else ""
+        )
         cmd = self._build_ffmpeg_command(seg_path)
 
         if cmd is None:
@@ -332,16 +370,16 @@ class ScreenRecorder(QObject):
 
         print(f"[Recorder] Starting segment {seg_index}: {' '.join(cmd[:6])}…", file=sys.stderr)
 
-        worker = _SegmentWorker(cmd, seg_path)
+        worker = _SegmentWorker(cmd, seg_path, audio_path)
         worker.finished.connect(self._on_segment_done)
         self._segment_worker = worker
         worker.start()
 
-    def _on_segment_done(self, seg_path: str, ok: bool):
+    def _on_segment_done(self, seg_path: str, audio_path: str, ok: bool):
         """Called when a segment worker finishes."""
         if ok:
-            self._segments.append(seg_path)
-            print(f"[Recorder] Segment saved: {seg_path}", file=sys.stderr)
+            self._segments.append((seg_path, audio_path))
+            print(f"[Recorder] Segment saved: {seg_path}  audio={audio_path or 'none'}", file=sys.stderr)
         else:
             print(f"[Recorder] Segment FAILED: {seg_path}", file=sys.stderr)
 
@@ -349,56 +387,98 @@ class ScreenRecorder(QObject):
             self._finalize()
         elif self._state == RecordingState.PAUSED:
             self.status_changed.emit("⏸ На паузе")
-        # If RECORDING: shouldn't happen (process ended unexpectedly)
         elif self._state == RecordingState.RECORDING:
-            # Segment crashed mid-recording — try to restart
             self.status_changed.emit("⚠ Сегмент прерван, перезапуск…")
             self._launch_segment()
 
     def _finalize(self):
-        """Concatenate all segments into the final file and log to DB."""
+        """Merge all segments into the final MP4 with audio and log to DB."""
         if not self._segments:
             self._state = RecordingState.IDLE
-            self.recording_error.emit("Нет записанных сегментов. Возможно, FFmpeg не запустился.")
+            self.recording_error.emit("Нет записанных сегментов.")
             return
 
+        ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
         output = self._final_path
         os.makedirs(os.path.dirname(output), exist_ok=True)
+        video_paths  = [v for v, _ in self._segments]
+        audio_paths  = [a for _, a in self._segments if a and os.path.exists(a)]
+        has_audio    = bool(audio_paths)
 
-        if len(self._segments) == 1:
-            # Single segment — just move it
-            import shutil as _sh
-            _sh.move(self._segments[0], output)
+        # ── Step 1: concat video segments ────────────────────────────────────
+        if len(video_paths) == 1:
+            raw_video = video_paths[0]
         else:
-            # Write concat list file
             concat_file = os.path.join(self._session_dir, "concat.txt")
             with open(concat_file, "w", encoding="utf-8") as f:
-                for seg in self._segments:
+                for seg in video_paths:
                     f.write(f"file '{seg}'\n")
-
-            ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-            concat_cmd = [
-                ffmpeg, "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", concat_file,
-                "-c", "copy",
-                output,
-            ]
+            raw_video = os.path.join(self._session_dir, "video_concat.mp4")
             try:
                 subprocess.run(
-                    concat_cmd,
-                    capture_output=True, timeout=120,
+                    [ffmpeg, "-y", "-f", "concat", "-safe", "0",
+                     "-i", concat_file, "-c", "copy", raw_video],
+                    capture_output=True, timeout=180,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             except Exception as e:
                 self._state = RecordingState.IDLE
-                self.recording_error.emit(f"Ошибка конкатенации: {e}")
+                self.recording_error.emit(f"Ошибка конкатенации видео: {e}")
                 return
 
-        # Cleanup temp dir
+        if not has_audio:
+            # No audio — just copy video to output
+            import shutil as _sh
+            _sh.move(raw_video, output)
+        else:
+            # ── Step 2: concat audio WAV files ───────────────────────────────
+            if len(audio_paths) == 1:
+                raw_audio = audio_paths[0]
+            else:
+                # Concatenate WAV files using ffmpeg concat
+                audio_concat_list = os.path.join(self._session_dir, "audio_concat.txt")
+                with open(audio_concat_list, "w", encoding="utf-8") as f:
+                    for ap in audio_paths:
+                        f.write(f"file '{ap}'\n")
+                raw_audio = os.path.join(self._session_dir, "audio_concat.wav")
+                try:
+                    subprocess.run(
+                        [ffmpeg, "-y", "-f", "concat", "-safe", "0",
+                         "-i", audio_concat_list, "-c", "copy", raw_audio],
+                        capture_output=True, timeout=60,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                except Exception as e:
+                    print(f"[Recorder] Audio concat error (will skip audio): {e}", file=sys.stderr)
+                    raw_audio = ""
+
+            # ── Step 3: mux video + audio into final MP4 ─────────────────────
+            if raw_audio and os.path.exists(raw_audio):
+                try:
+                    subprocess.run(
+                        [ffmpeg, "-y",
+                         "-i", raw_video,
+                         "-i", raw_audio,
+                         "-c:v", "copy",
+                         "-c:a", "aac", "-b:a", "128k",
+                         "-map", "0:v", "-map", "1:a",
+                         "-shortest",
+                         output],
+                        capture_output=True, timeout=300,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    print(f"[Recorder] Muxed video+audio -> {output}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[Recorder] Mux error (saving video only): {e}", file=sys.stderr)
+                    import shutil as _sh
+                    _sh.copy2(raw_video, output)
+            else:
+                import shutil as _sh
+                _sh.move(raw_video, output)
+
+        # ── Cleanup temp dir ─────────────────────────────────────────────────
         try:
-            import shutil as _sh2
-            _sh2.rmtree(self._session_dir, ignore_errors=True)
+            shutil.rmtree(self._session_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -419,77 +499,8 @@ class ScreenRecorder(QObject):
         self.status_changed.emit(f"✔ Сохранено ({_fmt_size(file_size)}, {duration}с)")
         self.recording_stopped.emit(os.path.abspath(output), duration)
 
-    # ── FFmpeg command builder ─────────────────────────────────────────────────
-
-    def _probe_audio(self):
-        """
-        Determine the best audio capture strategy.
-        Sets self._audio_cmd_parts and self._audio_map_parts.
-
-        Priority:
-          1. WASAPI loopback  → ALL Windows audio, no driver needed
-          2. dshow Stereo Mix → common loopback device
-          3. No audio (silent)
-
-        Mic: always try; mixed in as a bonus if available.
-        """
-        ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-        audio_inputs = []   # list of "-f ... -i ..." arg groups
-        audio_indices = []  # 1-based input indices (0 = video)
-
-        # --- System audio ---
-        system_ok = False
-
-        # Try WASAPI loopback first
-        if test_wasapi_loopback():
-            audio_inputs.append(["-f", "wasapi", "-loopback", "1", "-i", "default"])
-            audio_indices.append(len(audio_inputs))  # 1
-            system_ok = True
-            print("[Recorder] Audio: WASAPI loopback ✓", file=sys.stderr)
-        else:
-            # Try dshow Stereo Mix
-            dshow_devs = list_dshow_audio_devices()
-            loopback = _find_loopback_device(dshow_devs)
-            if loopback:
-                audio_inputs.append(["-f", "dshow", "-i", f"audio={loopback}"])
-                audio_indices.append(len(audio_inputs))
-                system_ok = True
-                print(f"[Recorder] Audio: dshow Stereo Mix '{loopback}' ✓", file=sys.stderr)
-            else:
-                print("[Recorder] Audio: no system audio device found ⚠", file=sys.stderr)
-
-        if not system_ok:
-            print("[Recorder] Recording will be SILENT.", file=sys.stderr)
-
-        # --- Microphone (optional) ---
-        dshow_devs_fresh = list_dshow_audio_devices()
-        mic = _find_mic_device(dshow_devs_fresh)
-        if mic:
-            audio_inputs.append(["-f", "dshow", "-i", f"audio={mic}"])
-            audio_indices.append(len(audio_inputs))
-            print(f"[Recorder] Mic: '{mic}' ✓", file=sys.stderr)
-        else:
-            print("[Recorder] Mic: not found or muted (will record system audio only)", file=sys.stderr)
-
-        # Build -map args
-        cmd_parts = []
-        for parts in audio_inputs:
-            cmd_parts.extend(parts)
-
-        map_parts = ["-map", "0:v"]
-        if len(audio_indices) == 2:
-            map_parts += [
-                "-filter_complex",
-                f"[{audio_indices[0]}:a][{audio_indices[1]}:a]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
-                "-map", "[aout]",
-            ]
-        elif len(audio_indices) == 1:
-            map_parts += ["-map", f"{audio_indices[0]}:a"]
-
-        self._audio_cmd_parts = cmd_parts
-        self._audio_map_parts = map_parts
-
     def _build_ffmpeg_command(self, output_path: str) -> Optional[list[str]]:
+        """Build FFmpeg command for VIDEO ONLY (audio captured separately by pyaudiowpatch)."""
         ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
         if not ffmpeg:
             self.recording_error.emit("ffmpeg не найден в PATH.")
@@ -501,10 +512,9 @@ class ScreenRecorder(QObject):
 
         print(f"[Recorder] Screen geometry: {w}x{h} at ({x},{y})", file=sys.stderr)
 
-        cmd = [ffmpeg, "-y"]
-
-        # Video input
-        cmd += [
+        cmd = [
+            ffmpeg, "-y",
+            # Video capture via GDI grab
             "-f", "gdigrab",
             "-framerate", "15",
             "-offset_x", str(x),
@@ -512,27 +522,16 @@ class ScreenRecorder(QObject):
             "-video_size", f"{w}x{h}",
             "-draw_mouse", "1",
             "-i", "desktop",
-        ]
-
-        # Audio inputs (pre-built in _probe_audio)
-        cmd += self._audio_cmd_parts
-
-        # Mapping
-        cmd += self._audio_map_parts
-
-        # Video codec: H.264, CRF 28, faster preset
-        cmd += [
+            # Map only video
+            "-map", "0:v",
+            # H.264 encoding
             "-vcodec", "libx264",
             "-preset", "faster",
             "-crf", "28",
             "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path,
         ]
-
-        # Audio codec (only if we have audio tracks)
-        if self._audio_cmd_parts:
-            cmd += ["-acodec", "aac", "-b:a", "128k"]
-
-        cmd += ["-movflags", "+faststart", output_path]
         return cmd
 
     # ── Path helpers ──────────────────────────────────────────────────────────
@@ -544,32 +543,6 @@ class ScreenRecorder(QObject):
         date_folder = now.strftime("%Y-%m-%d")
         filename = now.strftime("%H-%M") + f"_{safe}.mp4"
         return os.path.join(self.recordings_dir, date_folder, filename)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Free helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _find_loopback_device(devices: list[str]) -> str:
-    keywords = ["stereo mix", "what u hear", "loopback",
-                "воспроизведение со", "wave out", "sum"]
-    for d in devices:
-        dl = d.lower()
-        if any(kw in dl for kw in keywords):
-            return d
-    return ""
-
-
-def _find_mic_device(devices: list[str]) -> str:
-    loopback_kw = ["stereo mix", "what u hear", "loopback", "воспроизведение"]
-    mic_kw = ["microphone", "микрофон", "mic", "input", "headset"]
-    for d in devices:
-        dl = d.lower()
-        if any(kw in dl for kw in loopback_kw):
-            continue
-        if any(kw in dl for kw in mic_kw):
-            return d
-    return ""
 
 
 def _fmt_size(size_bytes: int) -> str:
