@@ -502,20 +502,18 @@ class FloatingTimer(QWidget):
 
     def open_recordings_search(self):
         """Open Streamlit recordings UI. Ensures only ONE instance is running."""
-        import os, sys, subprocess, socket, webbrowser, time
+        import os, sys, subprocess, socket, webbrowser, threading, time
 
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir   = os.path.dirname(os.path.abspath(__file__))
         app_script = os.path.join(base_dir, "app.py")
-        url = "http://localhost:8501"
+        url        = "http://localhost:8501"
 
         def _port_open(port: int) -> bool:
-            """Return True if something is already listening on the port."""
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(0.3)
+                s.settimeout(0.4)
                 return s.connect_ex(("127.0.0.1", port)) == 0
 
         if _port_open(8501):
-            # Streamlit already running — just open browser
             webbrowser.open(url)
             return
 
@@ -525,19 +523,32 @@ class FloatingTimer(QWidget):
             return
 
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 [sys.executable, "-m", "streamlit", "run", app_script,
-                 "--server.headless", "false",
-                 "--server.port", "8501"],
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                 "--server.headless", "true",
+                 "--server.port", "8501",
+                 "--browser.gatherUsageStats", "false"],
                 cwd=base_dir,
+                # No CREATE_NO_WINDOW so errors can be seen if needed
             )
-            # Brief pause for Streamlit to bind port, then open browser
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(2500, lambda: webbrowser.open(url))
         except Exception as e:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Streamlit", f"Ошибка запуска: {e}")
+            return
+
+        # Poll until port is ready (max 20 seconds)
+        def _wait_and_open():
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if _port_open(8501):
+                    webbrowser.open(url)
+                    return
+                time.sleep(0.5)
+            # Timed out — try anyway
+            webbrowser.open(url)
+
+        threading.Thread(target=_wait_and_open, daemon=True).start()
+
 
     def quit_app(self):
         from PySide6.QtWidgets import QApplication
