@@ -1,263 +1,294 @@
 """
-recorder.py — Screen & Audio Recorder Module
-=============================================
-Records the full desktop (all monitors combined) + system audio + microphone.
+recorder.py  ―  Screen & Audio Recorder
+========================================
+Records all monitors (gdigrab virtual desktop) + system audio (WASAPI
+loopback) + microphone (default input) into one MP4 per session.
 
-Architecture:
-  - Recording is split into SEGMENTS to support Pause/Resume
-  - Each segment: FFmpeg records VIDEO only; two audio threads run in parallel:
-      _LoopbackCaptureThread  — WASAPI loopback (all Windows speaker output)
-      _MicCaptureThread       — default microphone input (your voice)
-  - On Stop: _FinalizeWorker thread (background):
-      1. Concatenates video segments
-      2. Concatenates loopback WAVs
-      3. Concatenates mic WAVs
-      4. Mixes loopback + mic with amix
-      5. Muxes video + mixed audio → final MP4
-  - Final file is logged to SQLite
+Session lifecycle
+-----------------
+  start_recording()
+      │  probe audio devices (background thread)
+      │  create temp dir
+      └─► launch_segment()
+              │  FFmpeg  → segment_NNN.mp4          (video)
+              │  Loopback thread → loopback_NNN.wav (speaker output)
+              └─ Mic thread     → mic_NNN.wav       (microphone)
+  pause_recording() → stop_gracefully() → _on_segment_done
+  resume_recording() → launch_segment()
+  stop_recording()  → stop_gracefully() → _on_segment_done → _finalize()
+      │  _FinalizeWorker (QThread, never blocks UI):
+      │      concat video segments
+      │      concat loopback WAVs
+      │      concat mic WAVs
+      │      amix loopback + mic  → mixed.wav
+      │      ffmpeg mux video + mixed.wav → YYYY-MM-DD/HH-MM_Client.mp4
+      └─► _on_finalize_done → DB log + signals
 
-Audio strategy:
-  Loopback: pyaudiowpatch WASAPI loopback — all Windows audio (browser, calls)
-  Mic:      pyaudiowpatch default input   — your microphone voice
-  Both use SHARED mode — other apps (WhatsApp, Zoom) can use mic simultaneously.
-
-Signals (all Qt-thread-safe):
-  recording_started(client_name)
-  recording_stopped(file_path, duration_seconds)
-  recording_error(error_message)
-  status_changed(short_ui_text)
+Qt signals (emitted from Qt thread, safe to connect to UI slots)
+-----------------------------------------------------------------
+  recording_started(client_name: str)
+  recording_stopped(file_path: str, duration_sec: int)
+  recording_error(message: str)
+  status_changed(short_text: str)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import sys
-import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import wave
 from datetime import datetime
 from typing import Optional
 
-from PySide6.QtCore import QObject, Signal, QThread
+from PySide6.QtCore import QObject, QThread, Qt, QMetaObject, Signal, Slot
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Monitor geometry
+# Helpers: screen geometry
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_virtual_screen_geometry() -> tuple[int, int, int, int]:
-    """
-    Return (x, y, width, height) of the combined virtual desktop.
-    Tries screeninfo first; falls back to ctypes (always on Windows).
-    """
+    """Return (x, y, w, h) of the combined virtual desktop (all monitors)."""
     try:
         import screeninfo
-        monitors = screeninfo.get_monitors()
-        if monitors:
-            x_min = min(m.x for m in monitors)
-            y_min = min(m.y for m in monitors)
-            x_max = max(m.x + m.width  for m in monitors)
-            y_max = max(m.y + m.height for m in monitors)
-            return x_min, y_min, x_max - x_min, y_max - y_min
+        mons = screeninfo.get_monitors()
+        if mons:
+            x0 = min(m.x for m in mons)
+            y0 = min(m.y for m in mons)
+            x1 = max(m.x + m.width  for m in mons)
+            y1 = max(m.y + m.height for m in mons)
+            return x0, y0, x1 - x0, y1 - y0
     except Exception:
         pass
-
     try:
         import ctypes
-        u32 = ctypes.windll.user32
-        x = u32.GetSystemMetrics(76)
-        y = u32.GetSystemMetrics(77)
-        w = u32.GetSystemMetrics(78)
-        h = u32.GetSystemMetrics(79)
+        u = ctypes.windll.user32
+        x = u.GetSystemMetrics(76)
+        y = u.GetSystemMetrics(77)
+        w = u.GetSystemMetrics(78)
+        h = u.GetSystemMetrics(79)
         if w > 0 and h > 0:
             return x, y, w, h
     except Exception:
         pass
-
     return 0, 0, 1920, 1080
 
 
+def _even(n: int) -> int:
+    return n if n % 2 == 0 else n - 1
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Audio capture helpers
+# Helpers: audio
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _pyaudio():
-    """Import pyaudiowpatch, raise ImportError if unavailable."""
+def _import_pa():
+    """Return pyaudiowpatch module or raise ImportError."""
     import pyaudiowpatch as pa
     return pa
 
 
-def _open_wav(path: str, channels: int, rate: int, sample_width: int) -> wave.Wave_write:
-    wf = wave.open(path, "wb")
-    wf.setnchannels(channels)
-    wf.setsampwidth(sample_width)
-    wf.setframerate(rate)
-    return wf
-
-
-class _LoopbackCaptureThread(threading.Thread):
+def _write_wav_blocking(
+    output_path: str,
+    stop_event: threading.Event,
+    device_index: int,
+    channels: int,
+    rate: int,
+    is_loopback: bool,
+):
     """
-    Captures ALL Windows audio output (speakers/headphones) via WASAPI loopback.
-    Uses SHARED mode — does NOT block other applications from using audio.
+    Blocking audio capture loop. Run inside a daemon Thread.
+    Opens PyAudio stream in callback mode; writes PCM frames to a WAV file.
+    Returns True on success, False on error.
     """
-    def __init__(self, output_path: str):
-        super().__init__(daemon=True)
-        self.output_path = output_path
-        self._stop_event = threading.Event()
-        self.ok = False
-
-    def run(self):
-        try:
-            pa = _pyaudio()
-            p = pa.PyAudio()
-            device = p.get_default_wasapi_loopback()
-            channels = device["maxInputChannels"]
-            rate     = int(device["defaultSampleRate"])
-
-            with _open_wav(self.output_path, channels, rate,
-                           p.get_sample_size(pa.paInt16)) as wf:
-                def callback(in_data, frame_count, time_info, status):
-                    if self._stop_event.is_set():
-                        return (b"\x00" * len(in_data), pa.paComplete)
-                    wf.writeframes(in_data)
-                    return (None, pa.paContinue)
-
-                stream = p.open(
-                    format=pa.paInt16,
-                    channels=channels,
-                    rate=rate,
-                    frames_per_buffer=1024,
-                    input=True,
-                    input_device_index=device["index"],
-                    stream_callback=callback,
-                )
-                stream.start_stream()
-                while not self._stop_event.is_set() and stream.is_active():
-                    threading.Event().wait(0.05)
-                stream.stop_stream()
-                stream.close()
-
-            p.terminate()
-            self.ok = os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 44
-            if self.ok:
-                print(f"[Recorder] Loopback WAV: {self.output_path}", file=sys.stderr)
-        except Exception as e:
-            print(f"[Recorder] Loopback capture error: {e}", file=sys.stderr)
-            self.ok = False
-
-    def stop(self):
-        self._stop_event.set()
-
-
-class _MicCaptureThread(threading.Thread):
-    """
-    Captures microphone input (your voice) via the default input device.
-    Uses SHARED mode — WhatsApp/Zoom/Teams can use the mic at the same time.
-    """
-    def __init__(self, output_path: str):
-        super().__init__(daemon=True)
-        self.output_path = output_path
-        self._stop_event = threading.Event()
-        self.ok = False
-
-    def run(self):
-        try:
-            pa = _pyaudio()
-            p = pa.PyAudio()
-
-            # Get default microphone (standard input, not loopback)
-            mic_info = p.get_default_input_device_info()
-            channels = min(int(mic_info["maxInputChannels"]), 2)  # max stereo
-            rate     = int(mic_info["defaultSampleRate"])
-
-            print(f"[Recorder] Mic device: {mic_info['name']} "
-                  f"({channels}ch, {rate}Hz)", file=sys.stderr)
-
-            with _open_wav(self.output_path, channels, rate,
-                           p.get_sample_size(pa.paInt16)) as wf:
-                def callback(in_data, frame_count, time_info, status):
-                    if self._stop_event.is_set():
-                        return (b"\x00" * len(in_data), pa.paComplete)
-                    wf.writeframes(in_data)
-                    return (None, pa.paContinue)
-
-                stream = p.open(
-                    format=pa.paInt16,
-                    channels=channels,
-                    rate=rate,
-                    frames_per_buffer=1024,
-                    input=True,
-                    input_device_index=mic_info["index"],
-                    stream_callback=callback,
-                )
-                stream.start_stream()
-                while not self._stop_event.is_set() and stream.is_active():
-                    threading.Event().wait(0.05)
-                stream.stop_stream()
-                stream.close()
-
-            p.terminate()
-            self.ok = os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 44
-            if self.ok:
-                print(f"[Recorder] Mic WAV: {self.output_path}", file=sys.stderr)
-        except Exception as e:
-            print(f"[Recorder] Mic capture error: {e}", file=sys.stderr)
-            self.ok = False
-
-    def stop(self):
-        self._stop_event.set()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Misc helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_wasapi_loopback_device():
-    """Return (device_info_dict, PyAudio_instance) for the default WASAPI loopback.
-    Returns (None, None) if pyaudiowpatch is unavailable."""
     try:
-        pa = _pyaudio()
-        p = pa.PyAudio()
-        device = p.get_default_wasapi_loopback()
-        return device, p
+        pa = _import_pa()
+        p  = pa.PyAudio()
+
+        open_kwargs = dict(
+            format            = pa.paInt16,
+            channels          = channels,
+            rate              = rate,
+            frames_per_buffer = 1024,
+            input             = True,
+            input_device_index= device_index,
+        )
+        # pyaudiowpatch: loopback streams need as_loopback flag
+        if is_loopback:
+            open_kwargs["as_loopback"] = True
+
+        wf = wave.open(output_path, "wb")
+        wf.setnchannels(channels)
+        wf.setsampwidth(p.get_sample_size(pa.paInt16))
+        wf.setframerate(rate)
+
+        frames_written = [0]
+        errors = [0]
+
+        def _cb(in_data, frame_count, time_info, status_flags):
+            if stop_event.is_set():
+                return (None, pa.paComplete)
+            if in_data:
+                wf.writeframes(in_data)
+                frames_written[0] += frame_count
+            else:
+                errors[0] += 1
+            return (None, pa.paContinue)
+
+        stream = p.open(stream_callback=_cb, **open_kwargs)
+        stream.start_stream()
+        while not stop_event.is_set() and stream.is_active():
+            threading.Event().wait(0.05)
+        stream.stop_stream()
+        stream.close()
+        wf.close()
+        p.terminate()
+
+        ok = (
+            frames_written[0] > 0
+            and os.path.exists(output_path)
+            and os.path.getsize(output_path) > 44  # > WAV header
+        )
+        label = "loopback" if is_loopback else "mic"
+        if ok:
+            print(f"[Recorder] {label} OK → {output_path} "
+                  f"({frames_written[0]} frames)", file=sys.stderr)
+        else:
+            print(f"[Recorder] {label} empty/failed "
+                  f"(frames={frames_written[0]}, errors={errors[0]})", file=sys.stderr)
+        return ok
+
+    except Exception as exc:
+        label = "loopback" if is_loopback else "mic"
+        print(f"[Recorder] {label} exception: {exc}", file=sys.stderr)
+        return False
+
+
+class _AudioThread(threading.Thread):
+    """Generic daemon thread that captures audio to a WAV file."""
+
+    def __init__(self, path: str, device_index: int, channels: int,
+                 rate: int, is_loopback: bool):
+        super().__init__(daemon=True)
+        self.path         = path
+        self._device_idx  = device_index
+        self._channels    = channels
+        self._rate        = rate
+        self._is_loopback = is_loopback
+        self._stop        = threading.Event()
+        self.ok           = False
+
+    def run(self):
+        self.ok = _write_wav_blocking(
+            self.path, self._stop,
+            self._device_idx, self._channels, self._rate, self._is_loopback,
+        )
+
+    def stop(self):
+        self._stop.set()
+
+
+def _probe_audio() -> tuple[Optional[dict], Optional[dict]]:
+    """
+    Probe available audio devices.
+    Returns (loopback_info, mic_info); each is a dict with keys
+    {index, channels, rate} or None if not available.
+    """
+    loopback_info = None
+    mic_info      = None
+    try:
+        pa = _import_pa()
+        p  = pa.PyAudio()
+        try:
+            dev = p.get_default_wasapi_loopback()
+            loopback_info = {
+                "index"   : int(dev["index"]),
+                "channels": int(dev["maxInputChannels"]),
+                "rate"    : int(dev["defaultSampleRate"]),
+            }
+            print(f"[Recorder] Loopback: {dev['name']} "
+                  f"({loopback_info['channels']}ch, {loopback_info['rate']}Hz)",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"[Recorder] Loopback: unavailable ({e})", file=sys.stderr)
+
+        try:
+            dev = p.get_default_input_device_info()
+            ch  = min(int(dev.get("maxInputChannels", 0)), 2)
+            if ch > 0:
+                mic_info = {
+                    "index"   : int(dev["index"]),
+                    "channels": ch,
+                    "rate"    : int(dev["defaultSampleRate"]),
+                }
+                print(f"[Recorder] Mic: {dev['name']} "
+                      f"({ch}ch, {mic_info['rate']}Hz)", file=sys.stderr)
+        except Exception as e:
+            print(f"[Recorder] Mic: unavailable ({e})", file=sys.stderr)
+
+        p.terminate()
     except Exception as e:
-        print(f"[Recorder] WASAPI loopback unavailable: {e}", file=sys.stderr)
-        return None, None
+        print(f"[Recorder] pyaudiowpatch error: {e}", file=sys.stderr)
+
+    return loopback_info, mic_info
 
 
-def get_video_duration(file_path: str) -> int:
-    """Use ffprobe to get video duration in whole seconds."""
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: misc
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_video_duration(path: str) -> int:
+    """Return video duration in whole seconds via ffprobe."""
     ffprobe = shutil.which("ffprobe") or "ffprobe"
     try:
-        result = subprocess.run(
+        r = subprocess.run(
             [ffprobe, "-v", "quiet", "-print_format", "json",
-             "-show_format", file_path],
+             "-show_format", path],
             capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=15,
         )
-        data = json.loads(result.stdout)
-        return int(float(data.get("format", {}).get("duration", 0)))
+        return int(float(json.loads(r.stdout).get("format", {}).get("duration", 0)))
     except Exception:
         return 0
 
 
-def _fmt_size(size_bytes: int) -> str:
-    if size_bytes < 1024 ** 2:
-        return f"{size_bytes / 1024:.0f} KB"
-    if size_bytes < 1024 ** 3:
-        return f"{size_bytes / 1024 ** 2:.1f} MB"
-    return f"{size_bytes / 1024 ** 3:.2f} GB"
+def _fmt_size(b: int) -> str:
+    if b < 1 << 20:
+        return f"{b / 1024:.0f} KB"
+    if b < 1 << 30:
+        return f"{b / 1048576:.1f} MB"
+    return f"{b / 1073741824:.2f} GB"
+
+
+def _run(args: list[str], timeout: int = 120) -> bool:
+    """Run a subprocess silently. Returns True if exit code == 0."""
+    try:
+        r = subprocess.run(
+            args,
+            capture_output=True,
+            timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0 and r.stderr:
+            print(f"[Recorder] ffmpeg stderr: {r.stderr[-400:]}", file=sys.stderr)
+        return r.returncode == 0
+    except Exception as e:
+        print(f"[Recorder] subprocess error: {e}", file=sys.stderr)
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Recording state machine
+# State
 # ──────────────────────────────────────────────────────────────────────────────
 
-class RecordingState:
+class _S:
     IDLE      = "idle"
     RECORDING = "recording"
     PAUSED    = "paused"
@@ -265,481 +296,460 @@ class RecordingState:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Segment worker — FFmpeg video + loopback + mic in parallel
+# _SegmentWorker — one FFmpeg process + two audio threads per segment
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _SegmentWorker(QThread):
     """
-    Runs FFmpeg (video) + _LoopbackCaptureThread + _MicCaptureThread in parallel.
-    Emits finished(video_path, loopback_wav, mic_wav, ok).
-    Empty string means that track was unavailable/failed.
+    Runs in a background QThread.
+    Starts FFmpeg (video-only) and up to two audio threads simultaneously.
+    Emits `finished` when everything has stopped.
     """
-    finished = Signal(str, str, str, bool)  # video, loopback_wav, mic_wav, ok
+    # video_path, loopback_wav, mic_wav, video_ok
+    finished = Signal(str, str, str, bool)
 
-    def __init__(self, cmd: list[str], seg_path: str,
-                 loopback_path: str, mic_path: str):
+    def __init__(
+        self,
+        ffmpeg_cmd: list[str],
+        seg_path:      str,
+        loopback_path: str,           # empty string = skip
+        mic_path:      str,           # empty string = skip
+        loopback_info: Optional[dict],
+        mic_info:      Optional[dict],
+    ):
         super().__init__()
-        self.cmd           = cmd
-        self.seg_path      = seg_path
-        self.loopback_path = loopback_path
-        self.mic_path      = mic_path
-        self._process: Optional[subprocess.Popen] = None
-        self._loopback_t: Optional[_LoopbackCaptureThread] = None
-        self._mic_t:      Optional[_MicCaptureThread]      = None
+        self._cmd          = ffmpeg_cmd
+        self._seg_path     = seg_path
+        self._lb_path      = loopback_path
+        self._mic_path     = mic_path
+        self._lb_info      = loopback_info
+        self._mic_info     = mic_info
+        self._proc: Optional[subprocess.Popen] = None
+        self._lb_t:  Optional[_AudioThread]    = None
+        self._mic_t: Optional[_AudioThread]    = None
 
-    def run(self):
-        video_ok    = False
-        loopback_ok = False
-        mic_ok      = False
-        try:
-            # ── Start audio capture threads BEFORE FFmpeg ──────────────────────
-            if self.loopback_path:
-                self._loopback_t = _LoopbackCaptureThread(self.loopback_path)
-                self._loopback_t.start()
-            if self.mic_path:
-                self._mic_t = _MicCaptureThread(self.mic_path)
-                self._mic_t.start()
-
-            # ── FFmpeg video capture ───────────────────────────────────────────
-            self._process = subprocess.Popen(
-                self.cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            self._process.wait()
-            video_ok = (
-                os.path.exists(self.seg_path)
-                and os.path.getsize(self.seg_path) > 0
-            )
-        except Exception as e:
-            print(f"[Recorder segment] FFmpeg error: {e}", file=sys.stderr)
-        finally:
-            # ── Stop audio threads after FFmpeg exits ──────────────────────────
-            if self._loopback_t:
-                self._loopback_t.stop()
-                self._loopback_t.join(timeout=8)
-                loopback_ok = getattr(self._loopback_t, "ok", False)
-            if self._mic_t:
-                self._mic_t.stop()
-                self._mic_t.join(timeout=8)
-                mic_ok = getattr(self._mic_t, "ok", False)
-
-        actual_loopback = self.loopback_path if loopback_ok else ""
-        actual_mic      = self.mic_path      if mic_ok      else ""
-        self.finished.emit(self.seg_path, actual_loopback, actual_mic, video_ok)
+    # ── public ────────────────────────────────────────────────────────────────
 
     def stop_gracefully(self):
-        """Send 'q' to FFmpeg so it saves the segment cleanly."""
-        if self._process and self._process.poll() is None:
+        """Send 'q' to FFmpeg stdin (non-blocking). Audio stops in run()."""
+        proc = self._proc
+        if proc and proc.poll() is None:
             try:
-                self._process.stdin.write("q\n")
-                self._process.stdin.flush()
+                proc.stdin.write("q\n")
+                proc.stdin.flush()
             except OSError:
                 pass
-            try:
-                self._process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._process.terminate()
-        # Audio threads stop in run()'s finally block automatically
+
+    # ── QThread.run ───────────────────────────────────────────────────────────
+
+    def run(self):
+        video_ok = False
+        try:
+            # Start audio BEFORE ffmpeg so timestamps align
+            if self._lb_path and self._lb_info:
+                self._lb_t = _AudioThread(
+                    self._lb_path,
+                    self._lb_info["index"],
+                    self._lb_info["channels"],
+                    self._lb_info["rate"],
+                    is_loopback=True,
+                )
+                self._lb_t.start()
+
+            if self._mic_path and self._mic_info:
+                self._mic_t = _AudioThread(
+                    self._mic_path,
+                    self._mic_info["index"],
+                    self._mic_info["channels"],
+                    self._mic_info["rate"],
+                    is_loopback=False,
+                )
+                self._mic_t.start()
+
+            # Run FFmpeg
+            self._proc = subprocess.Popen(
+                self._cmd,
+                stdin  = subprocess.PIPE,
+                stdout = subprocess.DEVNULL,
+                stderr = subprocess.DEVNULL,
+                text   = True,
+                encoding = "utf-8",
+                errors   = "replace",
+                creationflags = subprocess.CREATE_NO_WINDOW,
+            )
+            self._proc.wait()
+            video_ok = (
+                os.path.exists(self._seg_path)
+                and os.path.getsize(self._seg_path) > 0
+            )
+        except Exception as exc:
+            print(f"[Recorder] FFmpeg error: {exc}", file=sys.stderr)
+        finally:
+            # Stop audio threads (they check stop event every 50 ms)
+            if self._lb_t:
+                self._lb_t.stop()
+                self._lb_t.join(timeout=10)
+            if self._mic_t:
+                self._mic_t.stop()
+                self._mic_t.join(timeout=10)
+
+        lb_out  = self._lb_path  if (self._lb_t  and self._lb_t.ok)  else ""
+        mic_out = self._mic_path if (self._mic_t and self._mic_t.ok) else ""
+        self.finished.emit(self._seg_path, lb_out, mic_out, video_ok)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Finalize worker — background thread, never blocks Qt main thread
+# _FinalizeWorker — background post-processing; never blocks the UI thread
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _FinalizeWorker(QThread):
     """
-    Post-processing in a background thread:
-      1. Concat video segments
-      2. Concat loopback WAVs
-      3. Concat mic WAVs
-      4. Mix loopback + mic (amix)
-      5. Mux video + mixed audio → MP4
+    Concatenates video segments, concatenates + mixes audio WAVs,
+    muxes everything into the final MP4. All heavy I/O in a background thread.
     """
-    done  = Signal(str, int, int)  # final_path, duration_sec, file_size_bytes
+    done  = Signal(str, int, int)   # final_path, duration_sec, file_size
     error = Signal(str)
 
-    def __init__(self, segments: list, final_path: str, session_dir: str):
+    def __init__(
+        self,
+        segments:    list[tuple[str, str, str]],   # (video, lb_wav, mic_wav)
+        final_path:  str,
+        session_dir: str,
+    ):
         super().__init__()
-        # segments: list of (video, loopback_wav, mic_wav)
-        self._segments    = segments
-        self._final_path  = final_path
-        self._session_dir = session_dir
+        self._segs    = segments
+        self._out     = final_path
+        self._tmp     = session_dir
 
     def run(self):
         ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-        output = self._final_path
+        out    = self._out
 
         try:
-            os.makedirs(os.path.dirname(output), exist_ok=True)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
         except Exception:
             pass
 
-        video_paths    = [v             for v, _, _   in self._segments]
-        loopback_paths = [lb            for _, lb, _  in self._segments
-                          if lb and os.path.exists(lb)]
-        mic_paths      = [mc            for _, _, mc  in self._segments
-                          if mc and os.path.exists(mc)]
-        has_loopback   = bool(loopback_paths)
-        has_mic        = bool(mic_paths)
-        has_audio      = has_loopback or has_mic
+        vids = [v for v, _, _ in self._segs if v and os.path.exists(v)]
+        lbs  = [l for _, l, _ in self._segs if l and os.path.exists(l)]
+        mics = [m for _, _, m in self._segs if m and os.path.exists(m)]
 
-        # ── Step 1: concat video ──────────────────────────────────────────────
-        if len(video_paths) == 1:
-            raw_video = video_paths[0]
-        else:
-            concat_f = os.path.join(self._session_dir, "concat_video.txt")
-            with open(concat_f, "w", encoding="utf-8") as f:
-                for seg in video_paths:
-                    f.write(f"file '{seg}'\n")
-            raw_video = os.path.join(self._session_dir, "video_concat.mp4")
-            try:
-                subprocess.run(
-                    [ffmpeg, "-y", "-f", "concat", "-safe", "0",
-                     "-i", concat_f, "-c", "copy", raw_video],
-                    capture_output=True, timeout=180,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            except Exception as e:
-                self.error.emit(f"Ошибка конкатенации видео: {e}")
-                return
-
-        if not has_audio:
-            _safe_move(raw_video, output)
-            self._emit_done(output)
+        if not vids:
+            self.error.emit("Нет видеофайлов для сохранения.")
             return
 
-        # ── Step 2: concat loopback WAVs ──────────────────────────────────────
-        raw_loopback = self._concat_wavs(ffmpeg, loopback_paths, "loopback_concat.wav")
+        # ── 1. Concat video ───────────────────────────────────────────────────
+        raw_video = self._concat_media(ffmpeg, vids, "concat_video.mp4")
+        if not raw_video:
+            self.error.emit("Ошибка сборки видео.")
+            return
 
-        # ── Step 3: concat mic WAVs ───────────────────────────────────────────
-        raw_mic = self._concat_wavs(ffmpeg, mic_paths, "mic_concat.wav")
+        # ── 2. Concat loopback WAVs ────────────────────────────────────────────
+        raw_lb = self._concat_media(ffmpeg, lbs, "concat_lb.wav") if lbs else ""
 
-        # ── Step 4: mix loopback + mic ────────────────────────────────────────
-        raw_audio = self._mix_audio(ffmpeg, raw_loopback, raw_mic)
+        # ── 3. Concat mic WAVs ────────────────────────────────────────────────
+        raw_mic = self._concat_media(ffmpeg, mics, "concat_mic.wav") if mics else ""
 
-        # ── Step 5: mux video + mixed audio ──────────────────────────────────
+        # ── 4. Mix audio ──────────────────────────────────────────────────────
+        raw_audio = self._mix(ffmpeg, raw_lb, raw_mic)
+
+        # ── 5. Mux video + audio → final MP4 ─────────────────────────────────
         if raw_audio and os.path.exists(raw_audio):
-            try:
-                subprocess.run(
-                    [ffmpeg, "-y",
-                     "-i", raw_video,
-                     "-i", raw_audio,
-                     "-c:v", "copy",
-                     "-c:a", "aac", "-b:a", "192k",
-                     "-map", "0:v", "-map", "1:a",
-                     "-shortest",
-                     output],
-                    capture_output=True, timeout=300,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-                print(f"[Recorder] Final: {output}", file=sys.stderr)
-            except Exception as e:
-                print(f"[Recorder] Mux error (video only): {e}", file=sys.stderr)
-                _safe_move(raw_video, output)
+            ok = _run([
+                ffmpeg, "-y",
+                "-i", raw_video,
+                "-i", raw_audio,
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-shortest",
+                out,
+            ], timeout=600)
+            if not ok:
+                print("[Recorder] Mux failed, saving video-only", file=sys.stderr)
+                shutil.copy2(raw_video, out)
         else:
-            _safe_move(raw_video, output)
+            print("[Recorder] No audio — saving video-only", file=sys.stderr)
+            try:
+                shutil.move(raw_video, out)
+            except Exception:
+                shutil.copy2(raw_video, out)
 
-        # ── Cleanup ───────────────────────────────────────────────────────────
+        # ── Cleanup temp dir ──────────────────────────────────────────────────
         try:
-            shutil.rmtree(self._session_dir, ignore_errors=True)
+            shutil.rmtree(self._tmp, ignore_errors=True)
         except Exception:
             pass
 
-        self._emit_done(output)
+        if not os.path.exists(out):
+            self.error.emit("Файл записи не был создан.")
+            return
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+        duration  = get_video_duration(out)
+        file_size = os.path.getsize(out)
+        self.done.emit(out, duration, file_size)
 
-    def _concat_wavs(self, ffmpeg: str, paths: list[str], out_name: str) -> str:
-        """Concatenate a list of WAV files. Returns path or empty string."""
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _concat_media(self, ffmpeg: str, paths: list[str], out_name: str) -> str:
+        """Concat list of same-codec media files. Returns output path or ''."""
         if not paths:
             return ""
-        if len(paths) == 1:
+        if len(paths) == 1 and os.path.exists(paths[0]):
             return paths[0]
-        concat_f = os.path.join(self._session_dir, out_name + ".txt")
-        with open(concat_f, "w", encoding="utf-8") as f:
+        lst = os.path.join(self._tmp, out_name + ".txt")
+        out = os.path.join(self._tmp, out_name)
+        with open(lst, "w", encoding="utf-8") as f:
             for p in paths:
-                f.write(f"file '{p}'\n")
-        out = os.path.join(self._session_dir, out_name)
-        try:
-            subprocess.run(
-                [ffmpeg, "-y", "-f", "concat", "-safe", "0",
-                 "-i", concat_f, "-c", "copy", out],
-                capture_output=True, timeout=60,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            return out if os.path.exists(out) else ""
-        except Exception as e:
-            print(f"[Recorder] WAV concat error: {e}", file=sys.stderr)
-            return ""
+                # Escape single quotes for ffmpeg concat list
+                escaped = p.replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+        ok = _run([
+            ffmpeg, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", lst,
+            "-c", "copy",
+            out,
+        ], timeout=180)
+        return out if (ok and os.path.exists(out)) else (paths[0] if paths else "")
 
-    def _mix_audio(self, ffmpeg: str, loopback: str, mic: str) -> str:
-        """Mix loopback + mic WAVs with amix. Returns path of mixed WAV."""
-        lb_ok  = loopback and os.path.exists(loopback)
-        mic_ok = mic      and os.path.exists(mic)
+    def _mix(self, ffmpeg: str, lb: str, mic: str) -> str:
+        """Mix loopback + mic with amix. Falls back gracefully."""
+        lb_ok  = bool(lb  and os.path.exists(lb))
+        mic_ok = bool(mic and os.path.exists(mic))
 
         if lb_ok and mic_ok:
-            mixed = os.path.join(self._session_dir, "mixed.wav")
-            try:
-                subprocess.run(
-                    [ffmpeg, "-y",
-                     "-i", loopback,
-                     "-i", mic,
-                     "-filter_complex",
-                     "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
-                     "-map", "[aout]",
-                     "-c:a", "pcm_s16le",
-                     mixed],
-                    capture_output=True, timeout=120,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-                if os.path.exists(mixed) and os.path.getsize(mixed) > 44:
-                    print("[Recorder] Audio mixed: loopback + mic ✓", file=sys.stderr)
-                    return mixed
-            except Exception as e:
-                print(f"[Recorder] amix error: {e}", file=sys.stderr)
-            # fallback: loopback only
-            return loopback
-        elif lb_ok:
-            print("[Recorder] Audio: loopback only (no mic)", file=sys.stderr)
-            return loopback
-        elif mic_ok:
-            print("[Recorder] Audio: mic only (no loopback)", file=sys.stderr)
+            mixed = os.path.join(self._tmp, "mixed.wav")
+            ok = _run([
+                ffmpeg, "-y",
+                "-i", lb, "-i", mic,
+                "-filter_complex",
+                "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0[a]",
+                "-map", "[a]",
+                "-c:a", "pcm_s16le",
+                mixed,
+            ], timeout=180)
+            if ok and os.path.exists(mixed) and os.path.getsize(mixed) > 44:
+                print("[Recorder] Audio: loopback + mic mixed ✓", file=sys.stderr)
+                return mixed
+            print("[Recorder] amix failed, falling back to loopback", file=sys.stderr)
+            return lb
+        if lb_ok:
+            print("[Recorder] Audio: loopback only", file=sys.stderr)
+            return lb
+        if mic_ok:
+            print("[Recorder] Audio: mic only", file=sys.stderr)
             return mic
         return ""
 
-    def _emit_done(self, output: str):
-        duration  = get_video_duration(output)
-        file_size = os.path.getsize(output) if os.path.exists(output) else 0
-        self.done.emit(output, duration, file_size)
-
-
-def _safe_move(src: str, dst: str):
-    try:
-        shutil.move(src, dst)
-    except Exception as e:
-        print(f"[Recorder] move {src} -> {dst} error: {e}", file=sys.stderr)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main recorder — coordinates segments, exposes public API
+# ScreenRecorder — public API
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ScreenRecorder(QObject):
     """
-    Manages multi-segment screen recording with pause/resume support.
+    Thread-safe screen recorder. All public methods are safe to call from the
+    Qt main thread. Signals are delivered in the Qt main thread.
 
-    Public API (call from main/Qt thread):
-      start_recording(client_name)
-      pause_recording()
-      resume_recording()
-      stop_recording()
+    Usage:
+        recorder = ScreenRecorder(db, recordings_dir="recordings")
+        recorder.start_recording("Client Name", segment_id=42)
+        recorder.pause_recording()
+        recorder.resume_recording()
+        recorder.stop_recording()
     """
 
     recording_started = Signal(str)       # client_name
-    recording_stopped = Signal(str, int)  # final_path, total_duration_seconds
+    recording_stopped = Signal(str, int)  # file_path, duration_sec
     recording_error   = Signal(str)       # error message
-    status_changed    = Signal(str)       # short UI text
+    status_changed    = Signal(str)       # short status for UI label
 
     def __init__(self, db, recordings_dir: str = "recordings"):
         super().__init__()
         self.db             = db
         self.recordings_dir = recordings_dir
 
-        self._state          = RecordingState.IDLE
-        self._client_name    = ""
-        self._session_dir    = ""
-        # Each segment: (video_mp4, loopback_wav, mic_wav)
-        self._segments: list[tuple[str, str, str]] = []
-        self._final_path     = ""
-        self._start_time: Optional[datetime] = None
-        self._segment_id: Optional[int]      = None
-        self._segment_worker: Optional[_SegmentWorker]   = None
-        self._finalize_worker: Optional[_FinalizeWorker] = None
-        self._has_loopback   = False
-        self._has_mic        = False
+        self._state: str                         = _S.IDLE
+        self._client_name: str                   = ""
+        self._segment_id:  Optional[int]         = None
+        self._session_dir: str                   = ""
+        self._final_path:  str                   = ""
+        self._segments: list[tuple[str, str, str]] = []   # (video, lb, mic)
 
-    # ── Public properties ─────────────────────────────────────────────────────
+        self._seg_worker: Optional[_SegmentWorker]   = None
+        self._fin_worker: Optional[_FinalizeWorker]  = None
+
+        # Audio device info — populated once per session in a background thread
+        self._lb_info:  Optional[dict] = None
+        self._mic_info: Optional[dict] = None
+
+    # ── properties ────────────────────────────────────────────────────────────
 
     @property
     def is_recording(self) -> bool:
-        return self._state in (RecordingState.RECORDING, RecordingState.PAUSED)
+        return self._state in (_S.RECORDING, _S.PAUSED)
 
     @property
     def is_paused(self) -> bool:
-        return self._state == RecordingState.PAUSED
+        return self._state == _S.PAUSED
 
     @property
     def state(self) -> str:
         return self._state
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── public API ────────────────────────────────────────────────────────────
 
     def start_recording(self, client_name: str, segment_id: int = None):
-        if self._state != RecordingState.IDLE:
+        """Start a new recording session (silently ignored if already active)."""
+        if self._state != _S.IDLE:
             self.status_changed.emit("⚠ Сначала остановите текущую запись")
             return
 
-        self._client_name = client_name.strip() or "Без_имени"
+        self._client_name = (client_name or "").strip() or "Без_имени"
         self._segment_id  = segment_id
-        self._start_time  = datetime.now()
         self._segments    = []
-        self._final_path  = self._build_final_path(self._client_name)
+        self._final_path  = self._make_final_path(self._client_name)
+        self._session_dir = tempfile.mkdtemp(prefix="rec_")
 
-        os.makedirs(os.path.dirname(self._final_path), exist_ok=True)
-        self._session_dir = tempfile.mkdtemp(prefix="rec_seg_")
-
-        # ── Probe audio availability once per session ─────────────────────────
-        self._has_loopback = False
-        self._has_mic      = False
         try:
-            pa = _pyaudio()
-            p  = pa.PyAudio()
-            try:
-                p.get_default_wasapi_loopback()
-                self._has_loopback = True
-                print("[Recorder] Loopback: WASAPI ✓", file=sys.stderr)
-            except Exception as e:
-                print(f"[Recorder] Loopback: unavailable ({e})", file=sys.stderr)
-            try:
-                info = p.get_default_input_device_info()
-                if info and int(info.get("maxInputChannels", 0)) > 0:
-                    self._has_mic = True
-                    print(f"[Recorder] Mic: {info['name']} ✓", file=sys.stderr)
-            except Exception as e:
-                print(f"[Recorder] Mic: unavailable ({e})", file=sys.stderr)
-            p.terminate()
+            os.makedirs(os.path.dirname(self._final_path), exist_ok=True)
         except Exception as e:
-            print(f"[Recorder] pyaudiowpatch unavailable: {e}", file=sys.stderr)
+            self.recording_error.emit(f"Не удалось создать папку: {e}")
+            return
 
-        if not self._has_loopback and not self._has_mic:
-            print("[Recorder] No audio — video only", file=sys.stderr)
+        def _probe_then_start():
+            lb, mic = _probe_audio()
+            self._lb_info  = lb
+            self._mic_info = mic
+            # Post _begin_recording back to the Qt thread
+            QMetaObject.invokeMethod(self, "_begin_recording",
+                                     Qt.ConnectionType.QueuedConnection)
 
-        self._state = RecordingState.RECORDING
-        self.recording_started.emit(self._client_name)
-        self._launch_segment()
+        threading.Thread(target=_probe_then_start, daemon=True).start()
 
     def pause_recording(self):
-        if self._state != RecordingState.RECORDING:
+        if self._state != _S.RECORDING:
             return
-        self._state = RecordingState.PAUSED
-        self.status_changed.emit("⏸ Пауза записи…")
-        if self._segment_worker:
-            self._segment_worker.stop_gracefully()
+        self._state = _S.PAUSED
+        self.status_changed.emit("⏸ Пауза…")
+        if self._seg_worker:
+            self._seg_worker.stop_gracefully()
+        # _on_segment_done will handle the rest
 
     def resume_recording(self):
-        if self._state != RecordingState.PAUSED:
+        if self._state != _S.PAUSED:
             return
-        self._state = RecordingState.RECORDING
-        self.status_changed.emit(f"⏺ Запись: {self._client_name}")
+        self._state = _S.RECORDING
+        self.status_changed.emit(f"⏺ {self._client_name}")
         self._launch_segment()
 
     def stop_recording(self):
-        if self._state not in (RecordingState.RECORDING, RecordingState.PAUSED):
+        if self._state not in (_S.RECORDING, _S.PAUSED):
             return
-        self._state = RecordingState.STOPPING
-        self.status_changed.emit("⏹ Сохранение записи…")
-        if self._segment_worker and self._segment_worker.isRunning():
-            self._segment_worker.stop_gracefully()
+        self._state = _S.STOPPING
+        self.status_changed.emit("⏹ Сохраняю…")
+        if self._seg_worker and self._seg_worker.isRunning():
+            self._seg_worker.stop_gracefully()
+            # _on_segment_done → _finalize
         else:
             self._finalize()
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # ── private slots (called from Qt thread) ─────────────────────────────────
+
+    @Slot()
+    def _begin_recording(self):
+        """Called in Qt thread after audio probe completes."""
+        if self._state != _S.IDLE:
+            return
+        self._state = _S.RECORDING
+        self.recording_started.emit(self._client_name)
+        self._launch_segment()
 
     def _launch_segment(self):
         idx = len(self._segments)
+        seg   = os.path.join(self._session_dir, f"seg_{idx:03d}.mp4")
+        lb    = os.path.join(self._session_dir, f"lb_{idx:03d}.wav")  if self._lb_info  else ""
+        mic   = os.path.join(self._session_dir, f"mic_{idx:03d}.wav") if self._mic_info else ""
 
-        seg_path      = os.path.join(self._session_dir, f"segment_{idx:03d}.mp4")
-        loopback_path = (
-            os.path.join(self._session_dir, f"loopback_{idx:03d}.wav")
-            if self._has_loopback else ""
-        )
-        mic_path = (
-            os.path.join(self._session_dir, f"mic_{idx:03d}.wav")
-            if self._has_mic else ""
-        )
-
-        cmd = self._build_ffmpeg_command(seg_path)
-        if cmd is None:
-            self._state = RecordingState.IDLE
-            self.recording_error.emit("Не удалось построить FFmpeg-команду.")
+        cmd = self._build_ffmpeg_cmd(seg)
+        if not cmd:
+            self._state = _S.IDLE
+            self.recording_error.emit("ffmpeg не найден в PATH.")
             return
 
-        print(f"[Recorder] Segment {idx}: {' '.join(cmd[:6])}…", file=sys.stderr)
+        print(f"[Recorder] start segment {idx}: {seg}", file=sys.stderr)
+        w = _SegmentWorker(cmd, seg, lb, mic, self._lb_info, self._mic_info)
+        w.finished.connect(self._on_segment_done)
+        self._seg_worker = w
+        w.start()
 
-        worker = _SegmentWorker(cmd, seg_path, loopback_path, mic_path)
-        worker.finished.connect(self._on_segment_done)
-        self._segment_worker = worker
-        worker.start()
-
-    def _on_segment_done(self, seg_path: str, loopback_wav: str,
-                         mic_wav: str, ok: bool):
+    def _on_segment_done(self, seg: str, lb_wav: str, mic_wav: str, ok: bool):
         if ok:
-            self._segments.append((seg_path, loopback_wav, mic_wav))
-            print(
-                f"[Recorder] Segment OK: {seg_path} | "
-                f"lb={loopback_wav or 'none'} | mic={mic_wav or 'none'}",
-                file=sys.stderr,
-            )
+            self._segments.append((seg, lb_wav, mic_wav))
+            print(f"[Recorder] segment done — video ok, "
+                  f"lb={bool(lb_wav)}, mic={bool(mic_wav)}", file=sys.stderr)
         else:
-            print(f"[Recorder] Segment FAILED: {seg_path}", file=sys.stderr)
+            # Video failed; still try to keep audio if we have previous segments
+            print(f"[Recorder] segment FAILED: {seg}", file=sys.stderr)
 
-        if self._state == RecordingState.STOPPING:
+        if self._state == _S.STOPPING:
             self._finalize()
-        elif self._state == RecordingState.PAUSED:
+        elif self._state == _S.PAUSED:
             self.status_changed.emit("⏸ На паузе")
-        elif self._state == RecordingState.RECORDING:
-            self.status_changed.emit("⚠ Сегмент прерван, перезапуск…")
+        elif self._state == _S.RECORDING:
+            # Unexpected crash of FFmpeg mid-recording → restart
+            self.status_changed.emit("⚠ Перезапуск…")
             self._launch_segment()
 
     def _finalize(self):
         if not self._segments:
-            self._state = RecordingState.IDLE
-            self.recording_error.emit("Нет записанных сегментов. FFmpeg мог не запуститься.")
+            self._state = _S.IDLE
+            self.recording_error.emit(
+                "Нет записанных сегментов.\n"
+                "Убедитесь, что ffmpeg установлен и доступен в PATH."
+            )
             return
 
-        worker = _FinalizeWorker(
+        w = _FinalizeWorker(
             segments    = list(self._segments),
             final_path  = self._final_path,
             session_dir = self._session_dir,
         )
-        worker.done.connect(self._on_finalize_done)
-        worker.error.connect(self._on_finalize_error)
-        self._finalize_worker = worker
-        worker.start()
+        w.done.connect(self._on_finalize_done)
+        w.error.connect(self._on_finalize_error)
+        self._fin_worker = w
+        w.start()
 
-    def _on_finalize_done(self, output: str, duration: int, file_size: int):
-        self.db.add_recording(
-            client_name = self._client_name,
-            file_path   = os.path.abspath(output),
-            duration    = duration,
-            file_size   = file_size,
-            segment_id  = self._segment_id,
-        )
-        self._state = RecordingState.IDLE
-        self.status_changed.emit(f"✔ Сохранено ({_fmt_size(file_size)}, {duration}с)")
-        self.recording_stopped.emit(os.path.abspath(output), duration)
+    def _on_finalize_done(self, path: str, duration: int, size: int):
+        try:
+            self.db.add_recording(
+                client_name = self._client_name,
+                file_path   = os.path.abspath(path),
+                duration    = duration,
+                file_size   = size,
+                segment_id  = self._segment_id,
+            )
+        except Exception as e:
+            print(f"[Recorder] DB write error: {e}", file=sys.stderr)
+        self._state = _S.IDLE
+        self.status_changed.emit(f"✔ Сохранено ({_fmt_size(size)}, {duration}с)")
+        self.recording_stopped.emit(os.path.abspath(path), duration)
 
     def _on_finalize_error(self, msg: str):
-        self._state = RecordingState.IDLE
+        self._state = _S.IDLE
         self.recording_error.emit(msg)
 
-    def _build_ffmpeg_command(self, output_path: str) -> Optional[list[str]]:
-        """VIDEO ONLY — audio captured separately by pyaudiowpatch."""
+    # ── FFmpeg command ─────────────────────────────────────────────────────────
+
+    def _build_ffmpeg_cmd(self, output: str) -> list[str]:
         ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-        if not ffmpeg:
-            self.recording_error.emit("ffmpeg не найден в PATH.")
-            return None
-
+        if not os.path.isabs(ffmpeg) and not shutil.which(ffmpeg):
+            return []
         x, y, w, h = get_virtual_screen_geometry()
-        w = w if w % 2 == 0 else w - 1
-        h = h if h % 2 == 0 else h - 1
-
-        print(f"[Recorder] Screen: {w}x{h} at ({x},{y})", file=sys.stderr)
-
+        w, h = _even(w), _even(h)
+        print(f"[Recorder] screen {w}x{h}+{x}+{y}", file=sys.stderr)
         return [
             ffmpeg, "-y",
             "-f", "gdigrab",
@@ -750,16 +760,18 @@ class ScreenRecorder(QObject):
             "-draw_mouse", "1",
             "-i", "desktop",
             "-map", "0:v",
-            "-vcodec", "libx264",
+            "-c:v", "libx264",
             "-preset", "faster",
             "-crf", "28",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            output_path,
+            output,
         ]
 
-    def _build_final_path(self, client_name: str) -> str:
-        now = datetime.now()
+    # ── path builder ──────────────────────────────────────────────────────────
+
+    def _make_final_path(self, client_name: str) -> str:
+        now  = datetime.now()
         safe = re.sub(r'[\\/:*?"<>|]', "_", client_name)
         return os.path.join(
             self.recordings_dir,

@@ -102,6 +102,8 @@ def main():
     timer_window.work_resumed.connect(on_work_resumed)
     timer_window.work_stopped.connect(on_work_stopped)
 
+    _cleanup_done = [False]   # guard against double cleanup
+
     # 4. Crash Recovery Check
     open_seg = db.get_open_segment()
     if open_seg:
@@ -228,10 +230,19 @@ def main():
 
     # 6. Final cleanup on exit
     def cleanup():
-        print("Станавливаю потоки и сохраняю данные...")
+        if _cleanup_done[0]:
+            return
+        _cleanup_done[0] = True
+        print("Останавливаю потоки и сохраняю данные...")
         idle_thread.stop()
         if hotkey_manager:
             hotkey_manager.stop()
+        # Disconnect timer→recorder sync BEFORE stop_work to prevent
+        # on_work_stopped from triggering a second stop_recording()
+        try:
+            timer_window.work_stopped.disconnect(on_work_stopped)
+        except Exception:
+            pass
         if recorder.is_recording:
             recorder.stop_recording()
         timer_window.stop_work()
